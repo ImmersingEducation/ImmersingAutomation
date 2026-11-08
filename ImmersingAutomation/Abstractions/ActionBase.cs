@@ -35,8 +35,8 @@ public abstract class ActionBase
     }
 
     /// <summary>
-    /// Requests the running action to stop.
-    /// Returns <see langword="false"/> when the action is not running.
+    /// Requests the running or reverting action to stop.
+    /// Returns <see langword="false"/> when the action is idle.
     /// </summary>
     public bool Interrupt()
     {
@@ -44,7 +44,7 @@ public abstract class ActionBase
 
         lock (_statusLock)
         {
-            if (_status != ActionStatus.Running)
+            if (_status is not (ActionStatus.Running or ActionStatus.Reverting))
             {
                 return false;
             }
@@ -116,22 +116,31 @@ public abstract class ActionBase
 
     public async Task RevertAsync()
     {
+        CancellationToken interruptionToken;
+
         lock (_statusLock)
         {
             EnsureStatus(ActionStatus.WaitingForReversion, nameof(RevertAsync));
 
             ResetInterruptionSource();
             _status = ActionStatus.Reverting;
+            interruptionToken = _interruptionSource.Token;
         }
 
         try
         {
+            interruptionToken.ThrowIfCancellationRequested();
             await _RevertAsync();
+        }
+        catch (OperationCanceledException) when (interruptionToken.IsCancellationRequested)
+        {
+            // Interruption is an expected transition and is handled below.
         }
         finally
         {
             lock (_statusLock)
             {
+                ResetInterruptionSource();
                 _status = ActionStatus.WaitingForRunning;
             }
         }
