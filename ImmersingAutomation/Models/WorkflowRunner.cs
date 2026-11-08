@@ -7,14 +7,30 @@ using ImmersingAutomation.Events;
 
 namespace ImmersingAutomation.Models;
 
+/// <summary>
+/// 执行单个 <see cref="Workflow"/>：根据工作流配置创建触发器、规则集和动作，
+/// 并驱动它们完成状态转换。
+/// </summary>
 public class WorkflowRunner : IAsyncDisposable
 {
+    /// <summary>
+    /// 获取运行器是否已成功初始化。
+    /// </summary>
     public bool Initialized { get; private set; } = false;
 
+    /// <summary>
+    /// 获取此运行器实例的唯一标识符。
+    /// </summary>
     public Guid Guid { get; } = Guid.NewGuid();
 
+    /// <summary>
+    /// 获取此运行器执行的工作流。
+    /// </summary>
     public Workflow Workflow { get; }
 
+    /// <summary>
+    /// 获取运行器的当前状态。
+    /// </summary>
     public WorkflowRunnerStatus Status
     {
         get
@@ -30,12 +46,24 @@ public class WorkflowRunner : IAsyncDisposable
 
     private readonly List<ActionBase> _actions = [];
 
+    /// <summary>
+    /// 获取根据 <see cref="Workflow.TriggerProfiles"/> 创建的触发器。
+    /// </summary>
     public IReadOnlyList<TriggerBase> Triggers { get; }
 
+    /// <summary>
+    /// 获取根据 <see cref="Workflow.RulesetProfile"/> 创建的规则集。
+    /// </summary>
     public Ruleset Ruleset { get; private set; } = null!;
 
+    /// <summary>
+    /// 获取根据 <see cref="Workflow.ActionProfiles"/> 创建的动作。
+    /// </summary>
     public IReadOnlyList<ActionBase> Actions { get; }
 
+    /// <summary>
+    /// 当运行器状态变化时发生。
+    /// </summary>
     public event EventHandler<WorkflowRunnerStatusChangedEventArgs>? StatusChanged;
 
     private readonly SemaphoreSlim _triggerLock = new(1, 1);
@@ -60,6 +88,10 @@ public class WorkflowRunner : IAsyncDisposable
 
     private bool _disposed;
 
+    /// <summary>
+    /// 初始化 <see cref="WorkflowRunner"/> 类的新实例。
+    /// </summary>
+    /// <param name="workflow">要执行的工作流。</param>
     public WorkflowRunner(Workflow workflow)
     {
         Workflow = workflow ?? throw new ArgumentNullException(nameof(workflow));
@@ -67,12 +99,19 @@ public class WorkflowRunner : IAsyncDisposable
         Actions = _actions.AsReadOnly();
     }
 
-    /// <inheritdoc cref="InitializeAsync"/>
+    /// <summary>
+    /// 同步初始化运行器。在异步路径中优先使用 <see cref="InitializeAsync"/>。
+    /// </summary>
     public void Initialize()
     {
         Task.Run(InitializeAsync).GetAwaiter().GetResult();
     }
 
+    /// <summary>
+    /// 根据工作流配置创建触发器、规则集和动作，并初始化触发器。
+    /// 运行器初始化完成后，重复调用将被忽略。
+    /// </summary>
+    /// <exception cref="ObjectDisposedException">运行器已销毁。</exception>
     public async Task InitializeAsync()
     {
         try
@@ -186,11 +225,15 @@ public class WorkflowRunner : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 处理触发器事件：验证规则集，匹配时执行动作。
+    /// 触发器处理是串行化的，因此并发触发不会导致工作流执行两次。
+    /// </summary>
     public async void OnTriggered(object? sender, EventArgs eventArgs)
     {
         if (_disposed || Status is not WorkflowRunnerStatus.WaitingForTriggering) return;
 
-        // Serialize trigger handling so concurrent triggers cannot run the ruleset and actions at once.
+        // 串行化触发器处理，避免并发触发同时执行规则集和动作。
         try
         {
             await _triggerLock.WaitAsync();
@@ -202,12 +245,12 @@ public class WorkflowRunner : IAsyncDisposable
 
         try
         {
-            // Re-check after acquiring the lock: the status may have changed while waiting.
+            // 获取锁后再次检查：等待期间状态可能已变化。
             if (_disposed || Status is not WorkflowRunnerStatus.WaitingForTriggering) return;
 
             lock (_statusLock)
             {
-                // Snapshot the workflow settings so later mutations cannot affect this run.
+                // 快照工作流设置，避免之后的修改影响本次运行。
                 _isReversionEnabled = Workflow.IsReversionEnabled;
                 _exceptionHandleMode = Workflow.ExceptionHandleMode;
             }
@@ -279,8 +322,7 @@ public class WorkflowRunner : IAsyncDisposable
                 catch (Exception) when (
                     _exceptionHandleMode is WorkflowRunnerExceptionHandleMode.Skip)
                 {
-                    // Skip mode: remember the failed action so reversion leaves it alone, and keep
-                    // running the remaining actions.
+                    // 跳过模式：记录失败的动作，以便回滚时跳过它，并继续执行剩余动作。
                     if (_isReversionEnabled)
                     {
                         lock (_statusLock)
@@ -294,7 +336,7 @@ public class WorkflowRunner : IAsyncDisposable
                 catch (Exception) when (
                     _exceptionHandleMode is WorkflowRunnerExceptionHandleMode.Interrupt)
                 {
-                    // Interrupt mode: stop the remaining actions and recover from the failed action.
+                    // 中断模式：停止剩余动作，并从失败的动作开始恢复。
                     RequestInterruption();
                 }
                 finally
@@ -305,8 +347,7 @@ public class WorkflowRunner : IAsyncDisposable
                     }
                 }
 
-                // The current action has either completed or has been interrupted and is now
-                // waiting for reversion, so it is part of the actions that may need reverting.
+                // 当前动作要么已完成，要么已被中断并等待回滚，因此属于可能需要回滚的动作。
                 lock (_statusLock)
                 {
                     _executedActionCount = i + 1;
@@ -357,16 +398,16 @@ public class WorkflowRunner : IAsyncDisposable
             }
             catch (ObjectDisposedException)
             {
-                // The runner was disposed while the trigger handler was finishing.
+                // 触发器处理器结束时运行器已被销毁。
             }
         }
     }
 
     /// <summary>
-    /// Requests the current run or reversion to be interrupted.
-    /// When running, reversion starts from the action that was running. When reverting, all
-    /// remaining reversions are cancelled and the action state machine is reset.
-    /// Returns <see langword="false"/> when the workflow runner cannot be interrupted now.
+    /// 请求中断当前运行或回滚。
+    /// 运行期间请求中断时，回滚从正在运行的动作开始；回滚期间请求中断时，
+    /// 取消所有剩余回滚并重置动作状态机。
+    /// 当前无法中断工作流运行器时返回 <see langword="false"/>。
     /// </summary>
     public bool Interrupt()
     {
@@ -402,8 +443,8 @@ public class WorkflowRunner : IAsyncDisposable
 
         if (resetImmediately)
         {
-            // No reversion loop is running, so cancel the pending reversion right here and
-            // return every action to the idle state without invoking their reversion.
+            // 当前没有回滚循环在运行，因此直接在此取消待处理的回滚，
+            // 并在不调用动作回滚的情况下将所有动作恢复到空闲状态。
             ResetAllActions();
             CompleteInterruption();
             return true;
@@ -413,6 +454,9 @@ public class WorkflowRunner : IAsyncDisposable
         return true;
     }
 
+    /// <summary>
+    /// 当运行器等待回滚时，开始回滚动作。
+    /// </summary>
     public async Task OnReversionTriggered(object? sender, EventArgs eventArgs)
     {
         bool reversionEnabled;
@@ -464,7 +508,7 @@ public class WorkflowRunner : IAsyncDisposable
             }
             catch (ObjectDisposedException)
             {
-                // The runner was disposed while the reversion handler was finishing.
+                // 回滚处理器结束时运行器已被销毁。
             }
         }
     }
@@ -483,8 +527,8 @@ public class WorkflowRunner : IAsyncDisposable
             {
                 executedActionCount = _executedActionCount;
 
-                // The interruption that stopped the run is now being handled. Clear the request
-                // before reverting so that a new interruption is required to stop the reversion.
+                // 停止本次运行的中断现在正在被处理。回滚前清除请求，
+                // 以便需要新的中断才能停止回滚。
                 _interruptionRequested = false;
                 _currentAction = null;
                 _status = WorkflowRunnerStatus.Reverting;
@@ -499,7 +543,7 @@ public class WorkflowRunner : IAsyncDisposable
 
         RaiseStatusChanged(WorkflowRunnerStatus.Reverting);
 
-        // Start at the action that was running when the interruption arrived.
+        // 从中断到达时正在运行的动作开始回滚。
         await RevertActionsAsync(executedActionCount - 1);
     }
 
@@ -507,7 +551,7 @@ public class WorkflowRunner : IAsyncDisposable
     {
         lock (_statusLock)
         {
-            // An interruption may have arrived between the status check and this transition.
+            // 中断可能在状态检查和本次状态转换之间到达。
             if (_status is not WorkflowRunnerStatus.WaitingForReversion || _interruptionRequested)
             {
                 return;
@@ -547,17 +591,17 @@ public class WorkflowRunner : IAsyncDisposable
                 }
                 catch (OperationCanceledException) when (IsInterruptionRequested)
                 {
-                    // Interruption is an expected transition and is handled below.
+                    // 中断是预期的状态转换，将在下方统一处理。
                 }
                 catch (Exception) when (
                     _exceptionHandleMode is WorkflowRunnerExceptionHandleMode.Skip)
                 {
-                    // Skip mode: ignore the failed reversion and continue with the remaining actions.
+                    // 跳过模式：忽略失败的回滚，继续执行剩余动作。
                 }
                 catch (Exception) when (
                     _exceptionHandleMode is WorkflowRunnerExceptionHandleMode.Interrupt)
                 {
-                    // Interrupt mode: cancel the remaining reversions and reset the action state machine.
+                    // 中断模式：取消剩余回滚并重置动作状态机。
                     RequestInterruption();
                 }
                 finally
@@ -573,7 +617,7 @@ public class WorkflowRunner : IAsyncDisposable
         {
             try
             {
-                // Reversion has finished or was interrupted; make sure every action is idle again.
+                // 回滚已完成或已被中断；确保所有动作都恢复到空闲状态。
                 ResetAllActions();
             }
             finally
@@ -695,12 +739,15 @@ public class WorkflowRunner : IAsyncDisposable
             }
             catch (Exception exception)
             {
-                // A faulty subscriber must not break the workflow state machine.
+                // 单个订阅者出错不应破坏工作流状态机。
                 Debug.WriteLine(exception);
             }
         }
     }
 
+    /// <summary>
+    /// 中断所有正在进行的运行或回滚，并释放触发器和动作。
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
         lock (_statusLock)
@@ -731,7 +778,7 @@ public class WorkflowRunner : IAsyncDisposable
         }
         catch (ObjectDisposedException)
         {
-            // Already disposed.
+            // 已经销毁。
         }
 
         var triggerLockTaken = false;
@@ -742,7 +789,7 @@ public class WorkflowRunner : IAsyncDisposable
         }
         catch (ObjectDisposedException)
         {
-            // Already disposed.
+            // 已经销毁。
         }
 
         try

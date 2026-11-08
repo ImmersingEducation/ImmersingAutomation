@@ -9,6 +9,10 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace ImmersingAutomation;
 
+/// <summary>
+/// 将工作流以 JSON 文件的形式存储在目录中，并使用关联 <see cref="AutomationService"/>
+/// 中注册的自动化类型进行还原。
+/// </summary>
 public sealed class AutomationStorageService : IAutomationStorageService
 {
     private const string WorkflowFileExtension = ".json";
@@ -16,6 +20,11 @@ public sealed class AutomationStorageService : IAutomationStorageService
 
     private readonly AutomationService _automationService;
 
+    /// <summary>
+    /// 初始化 <see cref="AutomationStorageService"/> 类的新实例。
+    /// </summary>
+    /// <param name="automationService">其注册类型用于序列化的服务。</param>
+    /// <param name="storagePath">存储工作流的目录。</param>
     public AutomationStorageService(AutomationService automationService, string storagePath)
     {
         ArgumentNullException.ThrowIfNull(automationService);
@@ -25,8 +34,16 @@ public sealed class AutomationStorageService : IAutomationStorageService
         StoragePath = Path.GetFullPath(storagePath);
     }
 
+    /// <summary>
+    /// 获取存储工作流的绝对目录。
+    /// </summary>
     public string StoragePath { get; }
 
+    /// <summary>
+    /// 使用已注册的自动化类型将工作流序列化为 JSON。
+    /// </summary>
+    /// <param name="workflow">要序列化的工作流。</param>
+    /// <returns><paramref name="workflow"/> 的 JSON 表示。</returns>
     public string SerializeWorkflow(Workflow workflow)
     {
         ArgumentNullException.ThrowIfNull(workflow);
@@ -34,6 +51,11 @@ public sealed class AutomationStorageService : IAutomationStorageService
         return SerializeWorkflow(workflow, CreateJsonSerializerOptions());
     }
 
+    /// <summary>
+    /// 使用已注册的自动化类型从 JSON 反序列化工作流。
+    /// </summary>
+    /// <param name="json">工作流的 JSON 表示。</param>
+    /// <returns>反序列化后的工作流。</returns>
     public Workflow DeserializeWorkflow(string json)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(json);
@@ -41,6 +63,11 @@ public sealed class AutomationStorageService : IAutomationStorageService
         return DeserializeWorkflow(json, CreateJsonSerializerOptions());
     }
 
+    /// <summary>
+    /// 序列化工作流并写入其文件，以原子方式替换之前的内容。
+    /// </summary>
+    /// <param name="workflow">要保存的工作流。</param>
+    /// <param name="cancellationToken">用于取消操作的标记。</param>
     public async Task SaveWorkflowAsync(Workflow workflow, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(workflow);
@@ -67,6 +94,12 @@ public sealed class AutomationStorageService : IAutomationStorageService
         }
     }
 
+    /// <summary>
+    /// 从其文件加载指定标识符的工作流。
+    /// </summary>
+    /// <param name="workflowId">工作流的标识符。</param>
+    /// <param name="cancellationToken">用于取消操作的标记。</param>
+    /// <returns>工作流；文件不存在时返回 <see langword="null"/>。</returns>
     public async Task<Workflow?> LoadWorkflowAsync(Guid workflowId, CancellationToken cancellationToken = default)
     {
         var filePath = GetWorkflowFilePath(workflowId);
@@ -79,6 +112,11 @@ public sealed class AutomationStorageService : IAutomationStorageService
         return DeserializeWorkflow(json, CreateJsonSerializerOptions());
     }
 
+    /// <summary>
+    /// 加载 <see cref="StoragePath"/> 中的每个工作流文件。
+    /// </summary>
+    /// <param name="cancellationToken">用于取消操作的标记。</param>
+    /// <returns>已存储的工作流；目录不存在时返回空列表。</returns>
     public async Task<IReadOnlyList<Workflow>> LoadWorkflowsAsync(CancellationToken cancellationToken = default)
     {
         if (!Directory.Exists(StoragePath))
@@ -98,11 +136,21 @@ public sealed class AutomationStorageService : IAutomationStorageService
         return workflows;
     }
 
+    /// <summary>
+    /// 确定工作流的文件是否存在。
+    /// </summary>
+    /// <param name="workflowId">工作流的标识符。</param>
     public bool WorkflowExists(Guid workflowId)
     {
         return File.Exists(GetWorkflowFilePath(workflowId));
     }
 
+    /// <summary>
+    /// 删除工作流的文件。
+    /// </summary>
+    /// <param name="workflowId">工作流的标识符。</param>
+    /// <param name="cancellationToken">用于取消操作的标记。</param>
+    /// <returns>文件存在且已删除时返回 <see langword="true"/>。</returns>
     public Task<bool> DeleteWorkflowAsync(Guid workflowId, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();

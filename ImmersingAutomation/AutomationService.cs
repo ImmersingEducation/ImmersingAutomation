@@ -8,6 +8,13 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace ImmersingAutomation;
 
+/// <summary>
+/// 承载工作流并驱动其触发器与回滚。
+/// </summary>
+/// <remarks>
+/// 服务会加载已存储的工作流，为每个启用的工作流创建 <see cref="WorkflowRunner"/>，
+/// 轮询已注册的触发器，并在启用回滚时轮询等待回滚的运行器的规则集。
+/// </remarks>
 public class AutomationService : IAsyncDisposable
 {
     private readonly ConcurrentDictionary<TriggerBase, byte> _activeTriggers = new();
@@ -29,29 +36,39 @@ public class AutomationService : IAsyncDisposable
     private int _initializeStarted;
     private int _disposed;
 
+    /// <summary>
+    /// 获取服务是否已初始化。
+    /// </summary>
     public bool IsInitialized { get; private set; } = false;
 
     /// <summary>
-    /// Interval between two polls of the registered triggers.
+    /// 两次轮询已注册触发器之间的间隔。
     /// </summary>
     public TimeSpan TriggerPollInterval { get; init; } = TimeSpan.FromMilliseconds(20);
 
     /// <summary>
-    /// Interval between two checks of the rulesets that are waiting for reversion.
+    /// 两次检查等待回滚的规则集之间的间隔。
     /// </summary>
     public TimeSpan ReversionPollInterval { get; init; } = TimeSpan.FromMilliseconds(50);
 
     /// <summary>
-    /// Maximum number of rulesets validated concurrently during one reversion poll.
+    /// 单次回滚轮询中并发验证的规则集最大数量。
     /// </summary>
     public int ReversionCheckConcurrency { get; init; } = 4;
 
+    /// <summary>
+    /// 获取或设置用于构建服务提供程序的服务集合；服务初始化后为 <see langword="null"/>。
+    /// </summary>
     public IServiceCollection? ServiceCollection
     {
         get => !IsInitialized ? _serviceCollection : null;
         set => _serviceCollection = value ?? new ServiceCollection();
     }
 
+    /// <summary>
+    /// 获取或设置用于解析自动化类型的服务提供程序；服务未初始化时为 <see langword="null"/>。
+    /// 设置提供程序也会将服务标记为已初始化。
+    /// </summary>
     public IServiceProvider? ServiceProvider
     {
         get => IsInitialized ? _serviceProvider : null;
@@ -69,11 +86,19 @@ public class AutomationService : IAsyncDisposable
 
     internal IEnumerable<ServiceDescriptor> ServiceDescriptors => _serviceCollection;
 
+    /// <summary>
+    /// 初始化 <see cref="AutomationService"/> 类的新实例。
+    /// </summary>
+    /// <param name="storageService">用于加载和持久化工作流的存储服务。</param>
     public AutomationService(IAutomationStorageService storageService)
     {
         _storageService = storageService;
     }
 
+    /// <summary>
+    /// 加载已存储的工作流，启动已启用工作流的运行器，并启动触发器和回滚查询循环。
+    /// 只有首次调用有效。
+    /// </summary>
     public async Task InitializeAsync()
     {
         if (Interlocked.Exchange(ref _initializeStarted, 1) != 0)
@@ -83,13 +108,13 @@ public class AutomationService : IAsyncDisposable
 
         try
         {
-            // Keep an externally provided provider; only build one when none was injected.
+            // 保留外部提供的提供程序；仅在未注入时才构建一个。
             _serviceProvider ??= _serviceCollection.BuildServiceProvider();
             _workflows = (await _storageService.LoadWorkflowsAsync().ConfigureAwait(false)).ToList();
 
             foreach (var workflow in _workflows)
             {
-                // Initialization may be retried after a failure, so do not subscribe twice.
+                // 初始化失败后可能会重试，因此不要重复订阅。
                 workflow.IsEnabledChanged -= OnWorkflowIsEnabledChanged;
                 workflow.IsEnabledChanged += OnWorkflowIsEnabledChanged;
             }
@@ -121,8 +146,8 @@ public class AutomationService : IAsyncDisposable
     }
 
     /// <summary>
-    /// Polls the registered triggers until <paramref name="cancellationToken"/> is cancelled.
-    /// Only one loop can run at a time.
+    /// 轮询已注册的触发器，直到 <paramref name="cancellationToken"/> 被取消。
+    /// 同一时间只能运行一个循环。
     /// </summary>
     public async Task TriggerQueryLoop(CancellationToken cancellationToken = default)
     {
@@ -131,7 +156,7 @@ public class AutomationService : IAsyncDisposable
             throw new InvalidOperationException("The trigger query loop is already running.");
         }
 
-        // The service lifetime also stops loops that were started by an external caller.
+        // 服务生命周期也会停止由外部调用方启动的循环。
         using var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken,
             _triggerLoopSource.Token);
@@ -147,7 +172,7 @@ public class AutomationService : IAsyncDisposable
 
             while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
             {
-                // Keys returns a snapshot, so registering/unregistering during the loop is safe.
+                // Keys 返回快照，因此在循环期间注册/注销是安全的。
                 foreach (var trigger in _activeTriggers.Keys)
                 {
                     if (cancellationToken.IsCancellationRequested)
@@ -162,13 +187,13 @@ public class AutomationService : IAsyncDisposable
 
                     try
                     {
-                        // Trigger() validates internally; calling Validate() first would evaluate
-                        // the condition twice, which is wrong for consuming triggers.
+                        // Trigger() 内部会进行验证；先调用 Validate() 会重复评估条件，
+                        // 这对消费型触发器来说是错误的。
                         trigger.Trigger();
                     }
                     catch (Exception exception)
                     {
-                        // A single faulty trigger must not stop the whole poll loop.
+                        // 单个触发器出错不应停止整个轮询循环。
                         Debug.WriteLine(
                             $"[AutomationService] Trigger '{trigger.GetType().FullName}' failed: {exception}");
                     }
@@ -177,7 +202,7 @@ public class AutomationService : IAsyncDisposable
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            // Expected when the service is shutting down.
+            // 服务关闭时属于预期情况。
         }
         finally
         {
@@ -185,6 +210,9 @@ public class AutomationService : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 停止由 <see cref="InitializeAsync"/> 启动的触发器查询循环，并等待其结束。
+    /// </summary>
     public async Task StopTriggerQueryLoopAsync()
     {
         await _triggerLoopSource.CancelAsync().ConfigureAwait(false);
@@ -201,7 +229,7 @@ public class AutomationService : IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
-            // Expected when the service is shutting down.
+            // 服务关闭时属于预期情况。
         }
         catch (Exception exception)
         {
@@ -222,8 +250,8 @@ public class AutomationService : IAsyncDisposable
     }
 
     /// <summary>
-    /// Polls the rulesets of the runners that are waiting for reversion and starts the reversion
-    /// as soon as their ruleset no longer matches. Only one loop can run at a time.
+    /// 轮询等待回滚的运行器的规则集，并在规则集不再匹配时立即开始回滚。
+    /// 同一时间只能运行一个循环。
     /// </summary>
     public async Task ReversionQueryLoop(CancellationToken cancellationToken = default)
     {
@@ -247,14 +275,14 @@ public class AutomationService : IAsyncDisposable
 
             while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
             {
-                // Keys returns a snapshot, so registering/unregistering during the loop is safe.
+                // Keys 返回快照，因此在循环期间注册/注销是安全的。
                 var runners = _reversionRunners.Keys.ToArray();
                 if (runners.Length == 0)
                 {
                     continue;
                 }
 
-                // Check the rulesets concurrently so one slow ruleset does not delay the others.
+                // 并发检查规则集，避免某个缓慢的规则集拖慢其他规则集。
                 await Parallel.ForEachAsync(
                     runners,
                     new ParallelOptions
@@ -267,7 +295,7 @@ public class AutomationService : IAsyncDisposable
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            // Expected when the service is shutting down.
+            // 服务关闭时属于预期情况。
         }
         finally
         {
@@ -297,7 +325,7 @@ public class AutomationService : IAsyncDisposable
         }
         catch (Exception exception)
         {
-            // A faulty ruleset must not stop the loop; keep polling and try again.
+            // 单个规则集出错不应停止循环；继续轮询并重试。
             Debug.WriteLine(
                 $"[AutomationService] Ruleset of runner '{runner.Guid}' failed: {exception}");
             return;
@@ -308,7 +336,7 @@ public class AutomationService : IAsyncDisposable
             return;
         }
 
-        // Remove before dispatching so the same waiting period reversion is started once.
+        // 在派发前先移除，确保同一段等待期只启动一次回滚。
         if (_reversionRunners.TryRemove(runner, out _))
         {
             TriggerReversion(runner);
@@ -317,8 +345,8 @@ public class AutomationService : IAsyncDisposable
 
     private void TriggerReversion(WorkflowRunner runner)
     {
-        // Do not await here: reverting may take long and must not block the poll loop for the
-        // other runners. OnReversionTriggered re-checks the runner status itself.
+        // 此处不要等待：回滚可能耗时较长，不能阻塞其他运行器的轮询循环。
+        // OnReversionTriggered 会自行再次检查运行器状态。
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         _reversionTasks.TryAdd(completion.Task, 0);
 
@@ -341,6 +369,9 @@ public class AutomationService : IAsyncDisposable
         });
     }
 
+    /// <summary>
+    /// 停止由 <see cref="InitializeAsync"/> 启动的回滚查询循环，并等待其结束。
+    /// </summary>
     public async Task StopReversionQueryLoopAsync()
     {
         await _reversionLoopSource.CancelAsync().ConfigureAwait(false);
@@ -357,7 +388,7 @@ public class AutomationService : IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
-            // Expected when the service is shutting down.
+            // 服务关闭时属于预期情况。
         }
         catch (Exception exception)
         {
@@ -367,6 +398,9 @@ public class AutomationService : IAsyncDisposable
         _reversionLoopTask = null;
     }
 
+    /// <summary>
+    /// 当 <see cref="Workflow.IsEnabled"/> 变化时，添加或移除工作流的运行器。
+    /// </summary>
     public async void OnWorkflowIsEnabledChanged(object? sender, EventArgs e)
     {
         try
@@ -387,11 +421,16 @@ public class AutomationService : IAsyncDisposable
         }
         catch (Exception exception)
         {
-            // The event is raised from a property setter; an escaping exception would crash the process.
+            // 事件由属性 setter 引发；异常逃逸会导致进程崩溃。
             Debug.WriteLine(exception);
         }
     }
 
+    /// <summary>
+    /// 为工作流创建并初始化运行器，并注册其触发器。
+    /// 同一工作流已存在运行器时不执行任何操作。
+    /// </summary>
+    /// <param name="workflow">要运行的工作流。</param>
     public async Task AddWorkflowRunner(Workflow workflow)
     {
         ArgumentNullException.ThrowIfNull(workflow);
@@ -419,10 +458,10 @@ public class AutomationService : IAsyncDisposable
         {
             await runner.InitializeAsync().ConfigureAwait(false);
 
-            // Register only after initialization succeeds: on failure the runner clears its
-            // Triggers collection, so the triggers could no longer be found for unregistration.
-            // The lock prevents a concurrent RemoveWorkflowRunner from disposing the runner
-            // between the check and the registration, which would leave stale triggers behind.
+            // 仅在初始化成功后注册：初始化失败时运行器会清空其触发器集合，
+            // 之后将无法找到这些触发器进行注销。
+            // 锁可防止并发的 RemoveWorkflowRunner 在检查和注册之间销毁运行器，
+            // 否则会遗留过期的触发器。
             await _runnerLock.WaitAsync().ConfigureAwait(false);
             try
             {
@@ -465,6 +504,10 @@ public class AutomationService : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 释放工作流的运行器并注销其触发器。
+    /// </summary>
+    /// <param name="workflow">要移除运行器的工作流。</param>
     public async Task RemoveWorkflowRunner(Workflow workflow)
     {
         WorkflowRunner? runner;
@@ -491,13 +534,17 @@ public class AutomationService : IAsyncDisposable
         }
         finally
         {
-            // DisposeAsync raises Destroying, but make sure nothing stays registered if it throws.
+            // DisposeAsync 会引发 Destroying，但也要确保即使它抛出异常也不会留下已注册项。
             UnregisterTriggers(runner);
             _reversionRunners.TryRemove(runner, out _);
             runner.StatusChanged -= OnWorkflowRunnerStatusChanged;
         }
     }
 
+    /// <summary>
+    /// 注册在服务外部初始化的运行器的触发器。
+    /// </summary>
+    /// <param name="runner">要注册的已初始化运行器。</param>
     public Task ExternallyInitializeWorkflowRunnerAsync(WorkflowRunner runner)
     {
         ArgumentNullException.ThrowIfNull(runner);
@@ -506,6 +553,9 @@ public class AutomationService : IAsyncDisposable
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// 跟踪等待回滚的运行器，并注销正在销毁的运行器的触发器。
+    /// </summary>
     public void OnWorkflowRunnerStatusChanged(object? sender, WorkflowRunnerStatusChangedEventArgs e)
     {
         if (sender is not WorkflowRunner runner)
@@ -513,7 +563,7 @@ public class AutomationService : IAsyncDisposable
             return;
         }
 
-        // The runner is only watched while it is waiting for its actions to be reverted.
+        // 仅在运行器等待其动作被回滚时对其进行监视。
         if (e.Status is WorkflowRunnerStatus.WaitingForReversion)
         {
             _reversionRunners.TryAdd(runner, 0);
@@ -526,7 +576,7 @@ public class AutomationService : IAsyncDisposable
         switch (e.Status)
         {
             case WorkflowRunnerStatus.Destroying:
-                // The runner clears its Triggers after raising Destroying, so unregister now.
+                // 运行器在引发 Destroying 后会清空其触发器，因此现在注销。
                 UnregisterTriggers(runner);
                 break;
             default:
@@ -550,6 +600,9 @@ public class AutomationService : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 停止查询循环，销毁所有运行器并释放服务资源。
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -584,8 +637,8 @@ public class AutomationService : IAsyncDisposable
             _runnerLock.Release();
         }
 
-        // Reversion tasks are tracked so shutdown does not race with a revert that is still
-        // running. Disposing the runners above interrupts them, so this normally completes fast.
+        // 会跟踪回滚任务，因此关闭过程不会与仍在运行的回滚竞争。
+        // 上方的运行器销毁会中断它们，因此通常能很快完成。
         var reversionTasks = _reversionTasks.Keys.ToArray();
         if (reversionTasks.Length > 0)
         {
