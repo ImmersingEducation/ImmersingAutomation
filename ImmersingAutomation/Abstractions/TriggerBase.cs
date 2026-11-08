@@ -26,17 +26,33 @@ public abstract class TriggerBase : IAsyncDisposable
     public event EventHandler? Triggered;
 
     /// <summary>
-    /// Raises <see cref="Triggered"/> only while the trigger is ready.
+    /// Determines whether the trigger can be triggered now.
+    /// The default implementation returns <see langword="false"/>; derived triggers override this
+    /// to check their own trigger condition. Readiness is enforced by <see cref="Trigger"/>.
+    /// </summary>
+    public virtual bool Validate()
+    {
+        return false;
+    }
+
+    /// <summary>
+    /// Raises <see cref="Triggered"/> only while the trigger is ready and its condition is met.
     /// Returns <see langword="false"/> when the trigger is not in the ready state.
     /// </summary>
-    protected bool Trigger()
+    public bool Trigger()
     {
         lock (_statusLock)
         {
-            if (_status != TriggerStatus.Ready)
+            if (_status is not TriggerStatus.Ready)
             {
                 return false;
             }
+        }
+
+        // Validate may read external state, so run it without holding the status lock.
+        if (!Validate())
+        {
+            return false;
         }
 
         Triggered?.Invoke(this, EventArgs.Empty);
