@@ -12,8 +12,10 @@ public class AutomationService : IAsyncDisposable
 {
     private readonly ConcurrentDictionary<TriggerBase, byte> _activeTriggers = new();
     private readonly ConcurrentDictionary<WorkflowRunner, byte> _reversionRunners = new();
+    private readonly ConcurrentDictionary<Task, byte> _reversionTasks = new();
     private readonly SemaphoreSlim _runnerLock = new(1, 1);
-    private readonly CancellationTokenSource _lifetimeSource = new();
+    private readonly CancellationTokenSource _triggerLoopSource = new();
+    private readonly CancellationTokenSource _reversionLoopSource = new();
 
     private IServiceCollection _serviceCollection = new ServiceCollection();
     private IServiceProvider _serviceProvider;
@@ -24,6 +26,7 @@ public class AutomationService : IAsyncDisposable
     private Task? _reversionLoopTask;
     private int _triggerLoopRunning;
     private int _reversionLoopRunning;
+    private int _initializeStarted;
     private int _disposed;
 
     public bool IsInitialized { get; private set; } = false;
@@ -37,6 +40,11 @@ public class AutomationService : IAsyncDisposable
     /// Interval between two checks of the rulesets that are waiting for reversion.
     /// </summary>
     public TimeSpan ReversionPollInterval { get; init; } = TimeSpan.FromMilliseconds(50);
+
+    /// <summary>
+    /// Maximum number of rulesets validated concurrently during one reversion poll.
+    /// </summary>
+    public int ReversionCheckConcurrency { get; init; } = 4;
 
     public IServiceCollection? ServiceCollection
     {
@@ -68,27 +76,38 @@ public class AutomationService : IAsyncDisposable
 
     public async Task InitializeAsync()
     {
-        if (IsInitialized)
+        if (Interlocked.Exchange(ref _initializeStarted, 1) != 0)
         {
             return;
         }
 
-        _serviceProvider = _serviceCollection.BuildServiceProvider();
-        _workflows = (await _storageService.LoadWorkflowsAsync().ConfigureAwait(false)).ToList();
-
-        foreach (var workflow in _workflows)
+        try
         {
-            workflow.IsEnabledChanged += OnWorkflowIsEnabledChanged;
-        }
+            // Keep an externally provided provider; only build one when none was injected.
+            _serviceProvider ??= _serviceCollection.BuildServiceProvider();
+            _workflows = (await _storageService.LoadWorkflowsAsync().ConfigureAwait(false)).ToList();
 
-        foreach (var workflow in _workflows.Where(workflow => workflow.IsEnabled))
+            foreach (var workflow in _workflows)
+            {
+                // Initialization may be retried after a failure, so do not subscribe twice.
+                workflow.IsEnabledChanged -= OnWorkflowIsEnabledChanged;
+                workflow.IsEnabledChanged += OnWorkflowIsEnabledChanged;
+            }
+
+            foreach (var workflow in _workflows.Where(workflow => workflow.IsEnabled))
+            {
+                await AddWorkflowRunner(workflow).ConfigureAwait(false);
+            }
+
+            StartTriggerQueryLoop();
+            StartReversionQueryLoop();
+            IsInitialized = true;
+        }
+        catch
         {
-            await AddWorkflowRunner(workflow).ConfigureAwait(false);
+            Volatile.Write(ref _initializeStarted, 0);
+            throw;
         }
-
-        StartTriggerQueryLoop();
-        StartReversionQueryLoop();
-        IsInitialized = true;
     }
 
     private void StartTriggerQueryLoop()
@@ -98,21 +117,26 @@ public class AutomationService : IAsyncDisposable
             return;
         }
 
-        _triggerLoopTask = Task.Run(() => RunTriggerQueryLoopAsync(_lifetimeSource.Token));
+        _triggerLoopTask = Task.Run(() => RunTriggerQueryLoopAsync(_triggerLoopSource.Token));
     }
 
     /// <summary>
     /// Polls the registered triggers until <paramref name="cancellationToken"/> is cancelled.
     /// Only one loop can run at a time.
     /// </summary>
-    public Task TriggerQueryLoop(CancellationToken cancellationToken = default)
+    public async Task TriggerQueryLoop(CancellationToken cancellationToken = default)
     {
         if (Interlocked.CompareExchange(ref _triggerLoopRunning, 1, 0) != 0)
         {
             throw new InvalidOperationException("The trigger query loop is already running.");
         }
 
-        return RunTriggerQueryLoopAsync(cancellationToken);
+        // The service lifetime also stops loops that were started by an external caller.
+        using var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            _triggerLoopSource.Token);
+
+        await RunTriggerQueryLoopAsync(linkedSource.Token).ConfigureAwait(false);
     }
 
     private async Task RunTriggerQueryLoopAsync(CancellationToken cancellationToken)
@@ -163,7 +187,7 @@ public class AutomationService : IAsyncDisposable
 
     public async Task StopTriggerQueryLoopAsync()
     {
-        await _lifetimeSource.CancelAsync().ConfigureAwait(false);
+        await _triggerLoopSource.CancelAsync().ConfigureAwait(false);
 
         var task = _triggerLoopTask;
         if (task is null)
@@ -194,21 +218,25 @@ public class AutomationService : IAsyncDisposable
             return;
         }
 
-        _reversionLoopTask = Task.Run(() => RunReversionQueryLoopAsync(_lifetimeSource.Token));
+        _reversionLoopTask = Task.Run(() => RunReversionQueryLoopAsync(_reversionLoopSource.Token));
     }
 
     /// <summary>
     /// Polls the rulesets of the runners that are waiting for reversion and starts the reversion
     /// as soon as their ruleset no longer matches. Only one loop can run at a time.
     /// </summary>
-    public Task ReversionQueryLoop(CancellationToken cancellationToken = default)
+    public async Task ReversionQueryLoop(CancellationToken cancellationToken = default)
     {
         if (Interlocked.CompareExchange(ref _reversionLoopRunning, 1, 0) != 0)
         {
             throw new InvalidOperationException("The reversion query loop is already running.");
         }
 
-        return RunReversionQueryLoopAsync(cancellationToken);
+        using var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            _reversionLoopSource.Token);
+
+        await RunReversionQueryLoopAsync(linkedSource.Token).ConfigureAwait(false);
     }
 
     private async Task RunReversionQueryLoopAsync(CancellationToken cancellationToken)
@@ -220,43 +248,21 @@ public class AutomationService : IAsyncDisposable
             while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
             {
                 // Keys returns a snapshot, so registering/unregistering during the loop is safe.
-                foreach (var runner in _reversionRunners.Keys)
+                var runners = _reversionRunners.Keys.ToArray();
+                if (runners.Length == 0)
                 {
-                    if (cancellationToken.IsCancellationRequested)
-                    {
-                        break;
-                    }
-
-                    if (runner.Status is not WorkflowRunnerStatus.WaitingForReversion)
-                    {
-                        _reversionRunners.TryRemove(runner, out _);
-                        continue;
-                    }
-
-                    bool rulesetMatches;
-                    try
-                    {
-                        rulesetMatches = await runner.Ruleset.ValidateAsync().ConfigureAwait(false);
-                    }
-                    catch (Exception exception)
-                    {
-                        // A faulty ruleset must not stop the loop; keep polling and try again.
-                        Debug.WriteLine(
-                            $"[AutomationService] Ruleset of runner '{runner.Guid}' failed: {exception}");
-                        continue;
-                    }
-
-                    if (rulesetMatches)
-                    {
-                        continue;
-                    }
-
-                    // Remove before dispatching so the same waiting period reversion is started once.
-                    if (_reversionRunners.TryRemove(runner, out _))
-                    {
-                        TriggerReversion(runner);
-                    }
+                    continue;
                 }
+
+                // Check the rulesets concurrently so one slow ruleset does not delay the others.
+                await Parallel.ForEachAsync(
+                    runners,
+                    new ParallelOptions
+                    {
+                        CancellationToken = cancellationToken,
+                        MaxDegreeOfParallelism = Math.Max(1, ReversionCheckConcurrency)
+                    },
+                    CheckReversionAsync).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -269,10 +275,53 @@ public class AutomationService : IAsyncDisposable
         }
     }
 
+    private async ValueTask CheckReversionAsync(
+        WorkflowRunner runner,
+        CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return;
+        }
+
+        if (runner.Status is not WorkflowRunnerStatus.WaitingForReversion)
+        {
+            _reversionRunners.TryRemove(runner, out _);
+            return;
+        }
+
+        bool rulesetMatches;
+        try
+        {
+            rulesetMatches = await runner.Ruleset.ValidateAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            // A faulty ruleset must not stop the loop; keep polling and try again.
+            Debug.WriteLine(
+                $"[AutomationService] Ruleset of runner '{runner.Guid}' failed: {exception}");
+            return;
+        }
+
+        if (rulesetMatches || cancellationToken.IsCancellationRequested)
+        {
+            return;
+        }
+
+        // Remove before dispatching so the same waiting period reversion is started once.
+        if (_reversionRunners.TryRemove(runner, out _))
+        {
+            TriggerReversion(runner);
+        }
+    }
+
     private void TriggerReversion(WorkflowRunner runner)
     {
         // Do not await here: reverting may take long and must not block the poll loop for the
         // other runners. OnReversionTriggered re-checks the runner status itself.
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _reversionTasks.TryAdd(completion.Task, 0);
+
         _ = Task.Run(async () =>
         {
             try
@@ -284,12 +333,17 @@ public class AutomationService : IAsyncDisposable
                 Debug.WriteLine(
                     $"[AutomationService] Reversion of runner '{runner.Guid}' failed: {exception}");
             }
+            finally
+            {
+                _reversionTasks.TryRemove(completion.Task, out _);
+                completion.TrySetResult();
+            }
         });
     }
 
     public async Task StopReversionQueryLoopAsync()
     {
-        await _lifetimeSource.CancelAsync().ConfigureAwait(false);
+        await _reversionLoopSource.CancelAsync().ConfigureAwait(false);
 
         var task = _reversionLoopTask;
         if (task is null)
@@ -396,6 +450,7 @@ public class AutomationService : IAsyncDisposable
 
             runner.StatusChanged -= OnWorkflowRunnerStatusChanged;
             UnregisterTriggers(runner);
+            _reversionRunners.TryRemove(runner, out _);
 
             try
             {
@@ -438,6 +493,7 @@ public class AutomationService : IAsyncDisposable
         {
             // DisposeAsync raises Destroying, but make sure nothing stays registered if it throws.
             UnregisterTriggers(runner);
+            _reversionRunners.TryRemove(runner, out _);
             runner.StatusChanged -= OnWorkflowRunnerStatusChanged;
         }
     }
@@ -528,6 +584,21 @@ public class AutomationService : IAsyncDisposable
             _runnerLock.Release();
         }
 
+        // Reversion tasks are tracked so shutdown does not race with a revert that is still
+        // running. Disposing the runners above interrupts them, so this normally completes fast.
+        var reversionTasks = _reversionTasks.Keys.ToArray();
+        if (reversionTasks.Length > 0)
+        {
+            try
+            {
+                await Task.WhenAll(reversionTasks).ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                Debug.WriteLine(exception);
+            }
+        }
+
         foreach (var workflow in _workflows)
         {
             workflow.IsEnabledChanged -= OnWorkflowIsEnabledChanged;
@@ -536,7 +607,9 @@ public class AutomationService : IAsyncDisposable
         _workflows.Clear();
         _activeTriggers.Clear();
         _reversionRunners.Clear();
-        _lifetimeSource.Dispose();
+        _reversionTasks.Clear();
+        _triggerLoopSource.Dispose();
+        _reversionLoopSource.Dispose();
         _runnerLock.Dispose();
     }
 }
