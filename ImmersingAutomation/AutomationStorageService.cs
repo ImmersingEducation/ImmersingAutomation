@@ -245,6 +245,9 @@ public sealed class AutomationStorageService : IAutomationStorageService
         private readonly Dictionary<Type, Guid> _actionProfileTypeIds = new();
         private readonly Dictionary<Type, Guid> _ruleTypeIds = new();
 
+        private readonly Dictionary<Guid, Type> _triggerProfileTypes = new();
+        private readonly Dictionary<Guid, Type> _actionProfileTypes = new();
+
         public static AutomationTypeRegistry Create(IEnumerable<ServiceDescriptor> descriptors)
         {
             var registry = new AutomationTypeRegistry();
@@ -280,6 +283,8 @@ public sealed class AutomationStorageService : IAutomationStorageService
 
         private void Register(Type implementationType)
         {
+            RegisterProfile(implementationType);
+
             var triggerAttribute = implementationType.GetCustomAttribute<TriggerAttribute>(inherit: false);
             if (triggerAttribute is not null && typeof(TriggerBase).IsAssignableFrom(implementationType))
             {
@@ -312,6 +317,50 @@ public sealed class AutomationStorageService : IAutomationStorageService
             }
         }
 
+        private void RegisterProfile(Type implementationType)
+        {
+            if (typeof(TriggerProfileBase).IsAssignableFrom(implementationType))
+            {
+                var profileAttribute = implementationType.GetCustomAttribute<TriggerProfileAttribute>(inherit: false);
+                if (profileAttribute is not null)
+                {
+                    var triggerAttribute = GetRequiredAttribute<TriggerAttribute>(
+                        profileAttribute.TriggerType,
+                        "trigger",
+                        implementationType);
+
+                    Add(_triggerProfileTypeIds, implementationType, triggerAttribute.Guid, "trigger profile");
+                    Add(_triggerProfileTypes, triggerAttribute.Guid, implementationType, "trigger profile");
+                }
+            }
+
+            if (typeof(ActionProfileBase).IsAssignableFrom(implementationType))
+            {
+                var profileAttribute = implementationType.GetCustomAttribute<ActionProfileAttribute>(inherit: false);
+                if (profileAttribute is not null)
+                {
+                    var actionAttribute = GetRequiredAttribute<ActionAttribute>(
+                        profileAttribute.ActionType,
+                        "action",
+                        implementationType);
+
+                    Add(_actionProfileTypeIds, implementationType, actionAttribute.Guid, "action profile");
+                    Add(_actionProfileTypes, actionAttribute.Guid, implementationType, "action profile");
+                }
+            }
+        }
+
+        private static TAttribute GetRequiredAttribute<TAttribute>(
+            Type targetType,
+            string kind,
+            Type profileType) where TAttribute : Attribute
+        {
+            return targetType.GetCustomAttribute<TAttribute>(inherit: false)
+                   ?? throw new InvalidOperationException(
+                       $"{kind} profile type '{profileType.FullName}' references {kind} type " +
+                       $"'{targetType.FullName}' which has no [{typeof(TAttribute).Name}].");
+        }
+
         public Guid GetTypeId<TBase>(Type concreteType) where TBase : class
         {
             var baseType = typeof(TBase);
@@ -323,6 +372,15 @@ public sealed class AutomationStorageService : IAutomationStorageService
                     return triggerTypeId;
                 }
 
+                var profileAttribute = concreteType.GetCustomAttribute<TriggerProfileAttribute>(inherit: false);
+                if (profileAttribute is not null)
+                {
+                    return GetRequiredAttribute<TriggerAttribute>(
+                        profileAttribute.TriggerType,
+                        "trigger",
+                        concreteType).Guid;
+                }
+
                 var triggerAttribute = concreteType.GetCustomAttribute<TriggerAttribute>(inherit: false);
                 if (triggerAttribute is not null)
                 {
@@ -331,7 +389,8 @@ public sealed class AutomationStorageService : IAutomationStorageService
 
                 throw new InvalidOperationException(
                     $"Trigger profile type '{concreteType.FullName}' is not associated with a registered trigger. " +
-                    $"Make sure the corresponding trigger implementation is registered and has a [{nameof(TriggerAttribute)}].");
+                    $"Make sure the corresponding trigger implementation is registered and has a [{nameof(TriggerAttribute)}], " +
+                    $"or annotate the profile with a [{nameof(TriggerProfileAttribute)}].");
             }
 
             if (baseType == typeof(ActionProfileBase))
@@ -339,6 +398,15 @@ public sealed class AutomationStorageService : IAutomationStorageService
                 if (_actionProfileTypeIds.TryGetValue(concreteType, out var actionTypeId))
                 {
                     return actionTypeId;
+                }
+
+                var profileAttribute = concreteType.GetCustomAttribute<ActionProfileAttribute>(inherit: false);
+                if (profileAttribute is not null)
+                {
+                    return GetRequiredAttribute<ActionAttribute>(
+                        profileAttribute.ActionType,
+                        "action",
+                        concreteType).Guid;
                 }
 
                 var actionAttribute = concreteType.GetCustomAttribute<ActionAttribute>(inherit: false);
@@ -349,7 +417,8 @@ public sealed class AutomationStorageService : IAutomationStorageService
 
                 throw new InvalidOperationException(
                     $"Action profile type '{concreteType.FullName}' is not associated with a registered action. " +
-                    $"Make sure the corresponding action implementation is registered and has a [{nameof(ActionAttribute)}].");
+                    $"Make sure the corresponding action implementation is registered and has a [{nameof(ActionAttribute)}], " +
+                    $"or annotate the profile with a [{nameof(ActionProfileAttribute)}].");
             }
 
             if (baseType == typeof(RuleBase))
@@ -378,12 +447,16 @@ public sealed class AutomationStorageService : IAutomationStorageService
 
             if (baseType == typeof(TriggerProfileBase))
             {
-                return GetProfileType(_triggerTypes, typeId, typeof(TriggerBase<>), "trigger");
+                return _triggerProfileTypes.TryGetValue(typeId, out var triggerProfileType)
+                    ? triggerProfileType
+                    : GetProfileType(_triggerTypes, typeId, typeof(TriggerBase<>), "trigger");
             }
 
             if (baseType == typeof(ActionProfileBase))
             {
-                return GetProfileType(_actionTypes, typeId, typeof(ActionBase<>), "action");
+                return _actionProfileTypes.TryGetValue(typeId, out var actionProfileType)
+                    ? actionProfileType
+                    : GetProfileType(_actionTypes, typeId, typeof(ActionBase<>), "action");
             }
 
             if (baseType == typeof(RuleBase))
