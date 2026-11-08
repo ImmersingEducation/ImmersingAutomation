@@ -1,6 +1,7 @@
 using ImmersingAutomation.Enums;
 using ImmersingAutomation.Events;
 using ImmersingAutomation.Models;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace ImmersingAutomation.Tests;
 
@@ -364,6 +365,84 @@ public class WorkflowRunnerTests
         await runner.DisposeAsync();
 
         Assert.Equal(WorkflowRunnerStatus.Destroying, runner.Status);
+    }
+
+    [Fact]
+    public async Task InitializeAsync_UsesServiceProviderForTriggerDependencies()
+    {
+        var services = new Microsoft.Extensions.DependencyInjection.ServiceCollection();
+        services.AddSingleton<TestDependency>();
+
+        await using var provider = services.BuildServiceProvider();
+        var workflow = TestWorkflows.Create(new DependencyTriggerProfile());
+        await using var runner = new WorkflowRunner(workflow, provider);
+
+        await runner.InitializeAsync();
+
+        var trigger = Assert.IsType<DependencyTrigger>(Assert.Single(runner.Triggers));
+        Assert.Equal(42, trigger.Dependency.Value);
+    }
+
+    [Fact]
+    public async Task InitializeAsync_WhenReversionIsEnabledForUnsupportedAction_Throws()
+    {
+        var workflow = TestWorkflows.Create(
+            new TestTriggerProfile(),
+            actionProfiles: [new NonReversibleActionProfile()],
+            isReversionEnabled: true);
+        await using var runner = new WorkflowRunner(workflow);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => runner.InitializeAsync());
+
+        Assert.False(runner.Initialized);
+        Assert.Empty(runner.Actions);
+    }
+
+    [Fact]
+    public async Task InitializeAsync_WhenReversionIsDisabledForUnsupportedAction_Succeeds()
+    {
+        var workflow = TestWorkflows.Create(
+            new TestTriggerProfile(),
+            actionProfiles: [new NonReversibleActionProfile()],
+            isReversionEnabled: false);
+        await using var runner = new WorkflowRunner(workflow);
+
+        await runner.InitializeAsync();
+
+        Assert.True(runner.Initialized);
+        Assert.Single(runner.Actions);
+    }
+
+    [Fact]
+    public async Task ActionFailure_RaisesErrorOccurred()
+    {
+        var failingProfile = new TestActionProfile
+        {
+            RunException = new InvalidOperationException("run failed")
+        };
+        var workflow = TestWorkflows.Create(
+            new TestTriggerProfile { ShouldTrigger = true },
+            actionProfiles: [failingProfile],
+            isReversionEnabled: true,
+            exceptionHandleMode: WorkflowRunnerExceptionHandleMode.Skip);
+        await using var runner = new WorkflowRunner(workflow);
+        await runner.InitializeAsync();
+
+        var errorCompletion = new TaskCompletionSource<AutomationErrorEventArgs>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        runner.ErrorOccurred += (_, eventArgs) => errorCompletion.TrySetResult(eventArgs);
+
+        var waitingForReversion = WaitForStatusAsync(
+            runner,
+            WorkflowRunnerStatus.WaitingForReversion);
+        runner.Triggers[0].Trigger();
+
+        var error = await errorCompletion.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await waitingForReversion;
+
+        Assert.Equal(AutomationErrorSource.Action, error.Source);
+        Assert.IsType<TestAction>(error.Action);
+        Assert.Same(runner, error.Runner);
     }
 
     private static Task WaitForStatusAsync(

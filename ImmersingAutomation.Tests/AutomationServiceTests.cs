@@ -1,6 +1,8 @@
 using ImmersingAutomation.Abstractions;
 using ImmersingAutomation.Enums;
+using ImmersingAutomation.Events;
 using ImmersingAutomation.Models;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace ImmersingAutomation.Tests;
 
@@ -238,7 +240,41 @@ public class AutomationServiceTests
     }
 
     [Fact]
-    public async Task ExternallyInitializeWorkflowRunnerAsync_RegistersTriggers()
+    public async Task ActionFailure_IsForwardedThroughServiceErrorOccurred()
+    {
+        var failingProfile = new TestActionProfile
+        {
+            RunException = new InvalidOperationException("run failed")
+        };
+        var workflow = TestWorkflows.Create(
+            new TestTriggerProfile { ShouldTrigger = true },
+            actionProfiles: [failingProfile],
+            isReversionEnabled: true,
+            isEnabled: true);
+        var storage = new FakeAutomationStorageService();
+        storage.Workflows.Add(workflow);
+
+        await using var service = new AutomationService(storage)
+        {
+            TriggerPollInterval = TimeSpan.FromMilliseconds(5),
+            ReversionPollInterval = TimeSpan.FromMinutes(1)
+        };
+
+        var errorCompletion = new TaskCompletionSource<AutomationErrorEventArgs>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        service.ErrorOccurred += (_, eventArgs) => errorCompletion.TrySetResult(eventArgs);
+
+        await service.InitializeAsync();
+
+        var error = await errorCompletion.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(AutomationErrorSource.Action, error.Source);
+        Assert.NotNull(error.Runner);
+        Assert.IsType<TestAction>(error.Action);
+    }
+
+    [Fact]
+    public async Task AddWorkflowRunner_RegistersTriggersForPolling()
     {
         var profile = new TestTriggerProfile();
         var triggered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -248,24 +284,120 @@ public class AutomationServiceTests
             return true;
         };
         var workflow = TestWorkflows.Create(profile);
-        var runner = new WorkflowRunner(workflow);
-        await runner.InitializeAsync();
 
         await using var service = new AutomationService(new FakeAutomationStorageService())
         {
             TriggerPollInterval = TimeSpan.FromMilliseconds(5)
         };
 
-        using var cancellationSource = new CancellationTokenSource();
-        await service.ExternallyInitializeWorkflowRunnerAsync(runner);
+        await service.AddWorkflowRunner(workflow);
 
+        using var cancellationSource = new CancellationTokenSource();
         var loop = service.TriggerQueryLoop(cancellationSource.Token);
 
         await triggered.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         await cancellationSource.CancelAsync();
         await loop.WaitAsync(TimeSpan.FromSeconds(5));
+    }
 
-        await runner.DisposeAsync();
+    [Fact]
+    public async Task InitializeAsync_WhenCalledConcurrently_InitializesOnce()
+    {
+        var storage = new FakeAutomationStorageService
+        {
+            LoadWorkflowsStarted = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously),
+            LoadWorkflowsGate = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously)
+        };
+        storage.Workflows.Add(TestWorkflows.Create(new TestTriggerProfile(), isEnabled: true));
+
+        await using var service = new AutomationService(storage)
+        {
+            TriggerPollInterval = TimeSpan.FromMinutes(1)
+        };
+
+        var first = service.InitializeAsync();
+        await storage.LoadWorkflowsStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var second = service.InitializeAsync();
+
+        storage.LoadWorkflowsGate.TrySetResult();
+        await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(service.IsInitialized);
+        Assert.Equal(1, storage.LoadWorkflowsCallCount);
+    }
+
+    [Fact]
+    public async Task InitializeAsync_WhenRunnerInitializationFails_RollsBackCreatedRunners()
+    {
+        var validProfile = new TestTriggerProfile();
+        var storage = new FakeAutomationStorageService();
+        storage.Workflows.Add(TestWorkflows.Create(validProfile, isEnabled: true));
+        storage.Workflows.Add(TestWorkflows.Create(new UnattributedTriggerProfile(), isEnabled: true));
+
+        await using var service = new AutomationService(storage)
+        {
+            TriggerPollInterval = TimeSpan.FromMinutes(1)
+        };
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => service.InitializeAsync());
+
+        Assert.False(service.IsInitialized);
+        Assert.Equal(1, validProfile.ReleaseCount);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_DisposesOwnedServiceProvider()
+    {
+        var services = new Microsoft.Extensions.DependencyInjection.ServiceCollection();
+        services.AddSingleton<DisposableSingleton>();
+
+        var service = new AutomationService(new FakeAutomationStorageService(), services);
+        await service.InitializeAsync();
+
+        var singleton = (DisposableSingleton)service.ServiceProvider!
+            .GetService(typeof(DisposableSingleton))!;
+
+        await service.DisposeAsync();
+
+        Assert.True(singleton.IsDisposed);
+    }
+
+    [Fact]
+    public async Task MethodsAfterDispose_ThrowObjectDisposedException()
+    {
+        var service = new AutomationService(new FakeAutomationStorageService());
+        await service.DisposeAsync();
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(
+            () => service.InitializeAsync());
+        await Assert.ThrowsAsync<ObjectDisposedException>(
+            () => service.AddWorkflowRunner(TestWorkflows.Create()));
+        await Assert.ThrowsAsync<ObjectDisposedException>(
+            () => service.RemoveWorkflowRunner(TestWorkflows.Create()));
+    }
+
+    [Fact]
+    public void PollIntervals_WhenInvalid_Throw()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => new AutomationService(new FakeAutomationStorageService())
+            {
+                TriggerPollInterval = TimeSpan.Zero
+            });
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => new AutomationService(new FakeAutomationStorageService())
+            {
+                ReversionPollInterval = TimeSpan.FromMilliseconds(-1)
+            });
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => new AutomationService(new FakeAutomationStorageService())
+            {
+                ReversionCheckConcurrency = 0
+            });
     }
 }

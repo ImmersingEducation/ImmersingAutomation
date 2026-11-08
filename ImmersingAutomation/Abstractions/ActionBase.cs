@@ -99,6 +99,7 @@ public abstract class ActionBase
     /// <param name="isReversionNeeded">动作运行后是否需要回滚。</param>
     public async Task RunAsync(bool isReversionNeeded)
     {
+        CancellationTokenSource interruptionSource;
         CancellationToken interruptionToken;
         int operationVersion;
 
@@ -107,15 +108,16 @@ public abstract class ActionBase
             EnsureStatus(ActionStatus.WaitingForRunning, nameof(RunAsync));
 
             ResetInterruptionSource();
+            interruptionSource = _interruptionSource;
             _status = ActionStatus.Running;
             operationVersion = ++_operationVersion;
-            interruptionToken = _interruptionSource.Token;
+            interruptionToken = interruptionSource.Token;
         }
 
         try
         {
             interruptionToken.ThrowIfCancellationRequested();
-            await _RunAsync();
+            await _RunAsync().ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (interruptionToken.IsCancellationRequested)
         {
@@ -123,6 +125,8 @@ public abstract class ActionBase
         }
         finally
         {
+            var disposeInterruptionSource = false;
+
             lock (_statusLock)
             {
                 // 强制重置会取代本次操作，因此不能恢复旧状态。
@@ -138,6 +142,16 @@ public abstract class ActionBase
                         _status = ActionStatus.WaitingForRunning;
                     }
                 }
+                else
+                {
+                    // ForceReset 替换了取消源；由本次操作负责释放不再被引用的源。
+                    disposeInterruptionSource = !ReferenceEquals(_interruptionSource, interruptionSource);
+                }
+            }
+
+            if (disposeInterruptionSource)
+            {
+                interruptionSource.Dispose();
             }
         }
     }
@@ -147,6 +161,7 @@ public abstract class ActionBase
     /// </summary>
     public async Task RevertAsync()
     {
+        CancellationTokenSource interruptionSource;
         CancellationToken interruptionToken;
         int operationVersion;
 
@@ -155,15 +170,16 @@ public abstract class ActionBase
             EnsureStatus(ActionStatus.WaitingForReversion, nameof(RevertAsync));
 
             ResetInterruptionSource();
+            interruptionSource = _interruptionSource;
             _status = ActionStatus.Reverting;
             operationVersion = ++_operationVersion;
-            interruptionToken = _interruptionSource.Token;
+            interruptionToken = interruptionSource.Token;
         }
 
         try
         {
             interruptionToken.ThrowIfCancellationRequested();
-            await _RevertAsync();
+            await _RevertAsync().ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (interruptionToken.IsCancellationRequested)
         {
@@ -171,6 +187,8 @@ public abstract class ActionBase
         }
         finally
         {
+            var disposeInterruptionSource = false;
+
             lock (_statusLock)
             {
                 // 强制重置会取代本次操作，因此不能恢复旧状态。
@@ -179,6 +197,16 @@ public abstract class ActionBase
                     ResetInterruptionSource();
                     _status = ActionStatus.WaitingForRunning;
                 }
+                else
+                {
+                    // ForceReset 替换了取消源；由本次操作负责释放不再被引用的源。
+                    disposeInterruptionSource = !ReferenceEquals(_interruptionSource, interruptionSource);
+                }
+            }
+
+            if (disposeInterruptionSource)
+            {
+                interruptionSource.Dispose();
             }
         }
     }
@@ -206,6 +234,7 @@ public abstract class ActionBase
     public void ForceReset()
     {
         CancellationTokenSource interruptionSource;
+        bool disposeInterruptionSource;
 
         lock (_statusLock)
         {
@@ -213,6 +242,13 @@ public abstract class ActionBase
             {
                 return;
             }
+
+            // 运行或回滚中的操作可能仍持有旧取消源的标记。
+            // 由该操作的 finally 负责释放取消源，避免在标记仍使用时将其销毁。
+            disposeInterruptionSource = _status is not (
+                ActionStatus.Running
+                or ActionStatus.Reverting
+                or ActionStatus.Interrupting);
 
             _operationVersion++;
             interruptionSource = _interruptionSource;
@@ -229,7 +265,10 @@ public abstract class ActionBase
             // 操作已经结束并释放了其取消源。
         }
 
-        interruptionSource.Dispose();
+        if (disposeInterruptionSource)
+        {
+            interruptionSource.Dispose();
+        }
     }
 
     /// <summary>

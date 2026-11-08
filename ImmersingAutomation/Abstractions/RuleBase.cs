@@ -18,17 +18,23 @@ public abstract class RuleBase
     /// <summary>
     /// 评估规则，不应用 <see cref="IsReversed"/>。
     /// </summary>
-    protected abstract Task<bool> _ValidateAsync();
+    /// <param name="cancellationToken">用于取消操作的标记。</param>
+    protected abstract Task<bool> _ValidateAsync(CancellationToken cancellationToken);
 
     /// <summary>
     /// 评估规则，并对结果应用 <see cref="IsReversed"/>。
     /// </summary>
+    /// <param name="cancellationToken">用于取消操作的标记。</param>
     /// <returns>规则匹配时返回 <see langword="true"/>。</returns>
-    public async Task<bool> ValidateAsync()
+    public async Task<bool> ValidateAsync(CancellationToken cancellationToken = default)
     {
-        var result = await _ValidateAsync();
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var result = await _ValidateAsync(cancellationToken).ConfigureAwait(false);
+
+        cancellationToken.ThrowIfCancellationRequested();
         return IsReversed ? !result : result;
-    } 
+    }
 }
 
 /// <summary>

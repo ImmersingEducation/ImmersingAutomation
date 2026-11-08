@@ -4,6 +4,7 @@ using ImmersingAutomation.Abstractions;
 using ImmersingAutomation.Attributes;
 using ImmersingAutomation.Enums;
 using ImmersingAutomation.Events;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace ImmersingAutomation.Models;
 
@@ -66,11 +67,23 @@ public class WorkflowRunner : IAsyncDisposable
     /// </summary>
     public event EventHandler<WorkflowRunnerStatusChangedEventArgs>? StatusChanged;
 
+    /// <summary>
+    /// 当后台工作流执行失败时发生。
+    /// </summary>
+    /// <remarks>
+    /// 动作失败、规则集验证失败以及异步触发处理中的未处理异常都会引发此事件。
+    /// </remarks>
+    public event EventHandler<AutomationErrorEventArgs>? ErrorOccurred;
+
     private readonly SemaphoreSlim _triggerLock = new(1, 1);
 
     private readonly SemaphoreSlim _initializeLock = new(1, 1);
 
     private readonly object _statusLock = new();
+
+    private readonly IServiceProvider? _serviceProvider;
+
+    private CancellationTokenSource _verificationSource = new();
 
     private readonly HashSet<ActionBase> _skippedActions = [];
 
@@ -92,9 +105,13 @@ public class WorkflowRunner : IAsyncDisposable
     /// 初始化 <see cref="WorkflowRunner"/> 类的新实例。
     /// </summary>
     /// <param name="workflow">要执行的工作流。</param>
-    public WorkflowRunner(Workflow workflow)
+    /// <param name="serviceProvider">
+    /// 用于创建触发器和动作的服务提供程序；为 <see langword="null"/> 时使用无参构造函数。
+    /// </param>
+    public WorkflowRunner(Workflow workflow, IServiceProvider? serviceProvider = null)
     {
         Workflow = workflow ?? throw new ArgumentNullException(nameof(workflow));
+        _serviceProvider = serviceProvider;
         Triggers = _triggers.AsReadOnly();
         Actions = _actions.AsReadOnly();
     }
@@ -116,7 +133,7 @@ public class WorkflowRunner : IAsyncDisposable
     {
         try
         {
-            await _initializeLock.WaitAsync();
+            await _initializeLock.WaitAsync().ConfigureAwait(false);
         }
         catch (ObjectDisposedException)
         {
@@ -152,7 +169,7 @@ public class WorkflowRunner : IAsyncDisposable
                             $"'{profileType.FullName}'.");
                     }
 
-                    var trigger = Activator.CreateInstance(profileAttr.TriggerType) as TriggerBase
+                    var trigger = CreateInstance(profileAttr.TriggerType) as TriggerBase
                         ?? throw new InvalidOperationException(
                             $"Failed to create trigger type '{profileAttr.TriggerType.FullName}'.");
 
@@ -178,7 +195,20 @@ public class WorkflowRunner : IAsyncDisposable
                             $"'{profileType.FullName}'.");
                     }
 
-                    var action = Activator.CreateInstance(profileAttr.ActionType) as ActionBase
+                    if (Workflow.IsReversionEnabled)
+                    {
+                        var actionAttribute = profileAttr.ActionType
+                            .GetCustomAttribute<ActionAttribute>(inherit: false);
+
+                        if (actionAttribute is not null && !actionAttribute.IsReversionSupported)
+                        {
+                            throw new InvalidOperationException(
+                                $"Action type '{profileAttr.ActionType.FullName}' does not support reversion, " +
+                                $"but workflow '{Workflow.Name}' has reversion enabled.");
+                        }
+                    }
+
+                    var action = CreateInstance(profileAttr.ActionType) as ActionBase
                         ?? throw new InvalidOperationException(
                             $"Failed to create action type '{profileAttr.ActionType.FullName}'.");
 
@@ -190,7 +220,7 @@ public class WorkflowRunner : IAsyncDisposable
 
                 foreach (var trigger in _triggers)
                 {
-                    await trigger.InitializeAsync();
+                    await trigger.InitializeAsync().ConfigureAwait(false);
                 }
 
                 Initialized = true;
@@ -204,7 +234,7 @@ public class WorkflowRunner : IAsyncDisposable
 
                     try
                     {
-                        await trigger.DisposeAsync();
+                        await trigger.DisposeAsync().ConfigureAwait(false);
                     }
                     catch (Exception exception)
                     {
@@ -229,14 +259,22 @@ public class WorkflowRunner : IAsyncDisposable
     /// 处理触发器事件：验证规则集，匹配时执行动作。
     /// 触发器处理是串行化的，因此并发触发不会导致工作流执行两次。
     /// </summary>
-    public async void OnTriggered(object? sender, EventArgs eventArgs)
+    private void OnTriggered(object? sender, EventArgs eventArgs)
+    {
+        _ = HandleTriggeredAsync();
+    }
+
+    private async Task HandleTriggeredAsync()
     {
         if (_disposed || Status is not WorkflowRunnerStatus.WaitingForTriggering) return;
+
+        // 让触发器轮询循环立即返回，避免同步完成的动作占用轮询线程。
+        await Task.Yield();
 
         // 串行化触发器处理，避免并发触发同时执行规则集和动作。
         try
         {
-            await _triggerLock.WaitAsync();
+            await _triggerLock.WaitAsync().ConfigureAwait(false);
         }
         catch (ObjectDisposedException)
         {
@@ -255,8 +293,30 @@ public class WorkflowRunner : IAsyncDisposable
                 _exceptionHandleMode = Workflow.ExceptionHandleMode;
             }
 
+            CancellationToken verificationToken;
+            lock (_statusLock)
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                ResetVerificationSource();
+                verificationToken = _verificationSource.Token;
+            }
+
             OnStatusChanged(WorkflowRunnerStatus.VerifyingRuleset);
-            var rulesetResult = await Ruleset.ValidateAsync();
+
+            bool rulesetResult;
+            try
+            {
+                rulesetResult = await Ruleset.ValidateAsync(verificationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (verificationToken.IsCancellationRequested)
+            {
+                CompleteInterruption();
+                return;
+            }
 
             if (!rulesetResult)
             {
@@ -317,11 +377,13 @@ public class WorkflowRunner : IAsyncDisposable
 
                 try
                 {
-                    await action.RunAsync(_isReversionEnabled);
+                    await action.RunAsync(_isReversionEnabled).ConfigureAwait(false);
                 }
-                catch (Exception) when (
+                catch (Exception exception) when (
                     _exceptionHandleMode is WorkflowRunnerExceptionHandleMode.Skip)
                 {
+                    RaiseError(AutomationErrorSource.Action, "Run action", exception, action);
+
                     // 跳过模式：记录失败的动作，以便回滚时跳过它，并继续执行剩余动作。
                     if (_isReversionEnabled)
                     {
@@ -333,9 +395,11 @@ public class WorkflowRunner : IAsyncDisposable
                         action.ForceReset();
                     }
                 }
-                catch (Exception) when (
+                catch (Exception exception) when (
                     _exceptionHandleMode is WorkflowRunnerExceptionHandleMode.Interrupt)
                 {
+                    RaiseError(AutomationErrorSource.Action, "Run action", exception, action);
+
                     // 中断模式：停止剩余动作，并从失败的动作开始恢复。
                     RequestInterruption();
                 }
@@ -356,7 +420,7 @@ public class WorkflowRunner : IAsyncDisposable
 
             if (IsInterruptionRequested)
             {
-                await RevertAfterInterruptionAsync();
+                await RevertAfterInterruptionAsync().ConfigureAwait(false);
                 return;
             }
 
@@ -378,7 +442,7 @@ public class WorkflowRunner : IAsyncDisposable
 
             if (interrupted)
             {
-                await RevertAfterInterruptionAsync();
+                await RevertAfterInterruptionAsync().ConfigureAwait(false);
             }
             else
             {
@@ -387,7 +451,7 @@ public class WorkflowRunner : IAsyncDisposable
         }
         catch (Exception exception)
         {
-            Debug.WriteLine(exception);
+            RaiseError(AutomationErrorSource.Workflow, "Execute workflow", exception);
             ResetToIdle();
         }
         finally
@@ -412,6 +476,7 @@ public class WorkflowRunner : IAsyncDisposable
     public bool Interrupt()
     {
         ActionBase? currentAction;
+        CancellationTokenSource? verificationSource = null;
         bool resetImmediately;
 
         lock (_statusLock)
@@ -419,6 +484,13 @@ public class WorkflowRunner : IAsyncDisposable
             switch (_status)
             {
                 case WorkflowRunnerStatus.VerifyingRuleset:
+                    _interruptionRequested = true;
+                    _status = WorkflowRunnerStatus.Interrupting;
+                    currentAction = null;
+                    verificationSource = _verificationSource;
+                    resetImmediately = false;
+                    break;
+
                 case WorkflowRunnerStatus.Running:
                 case WorkflowRunnerStatus.Reverting:
                     _interruptionRequested = true;
@@ -440,6 +512,18 @@ public class WorkflowRunner : IAsyncDisposable
         }
 
         RaiseStatusChanged(WorkflowRunnerStatus.Interrupting);
+
+        if (verificationSource is not null)
+        {
+            try
+            {
+                verificationSource.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // 规则集验证已经结束并释放了取消源。
+            }
+        }
 
         if (resetImmediately)
         {
@@ -470,7 +554,7 @@ public class WorkflowRunner : IAsyncDisposable
 
         try
         {
-            await _triggerLock.WaitAsync();
+            await _triggerLock.WaitAsync().ConfigureAwait(false);
         }
         catch (ObjectDisposedException)
         {
@@ -493,11 +577,11 @@ public class WorkflowRunner : IAsyncDisposable
                 return;
             }
 
-            await StartReversionAsync(executedActionCount - 1);
+            await StartReversionAsync(executedActionCount - 1).ConfigureAwait(false);
         }
         catch (Exception exception)
         {
-            Debug.WriteLine(exception);
+            RaiseError(AutomationErrorSource.Workflow, "Revert workflow", exception);
             ResetToIdle();
         }
         finally
@@ -544,7 +628,7 @@ public class WorkflowRunner : IAsyncDisposable
         RaiseStatusChanged(WorkflowRunnerStatus.Reverting);
 
         // 从中断到达时正在运行的动作开始回滚。
-        await RevertActionsAsync(executedActionCount - 1);
+        await RevertActionsAsync(executedActionCount - 1).ConfigureAwait(false);
     }
 
     private async Task StartReversionAsync(int startIndex)
@@ -562,7 +646,7 @@ public class WorkflowRunner : IAsyncDisposable
         }
 
         RaiseStatusChanged(WorkflowRunnerStatus.Reverting);
-        await RevertActionsAsync(startIndex);
+        await RevertActionsAsync(startIndex).ConfigureAwait(false);
     }
 
     private async Task RevertActionsAsync(int startIndex)
@@ -587,20 +671,24 @@ public class WorkflowRunner : IAsyncDisposable
 
                 try
                 {
-                    await action.RevertAsync();
+                    await action.RevertAsync().ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (IsInterruptionRequested)
                 {
                     // 中断是预期的状态转换，将在下方统一处理。
                 }
-                catch (Exception) when (
+                catch (Exception exception) when (
                     _exceptionHandleMode is WorkflowRunnerExceptionHandleMode.Skip)
                 {
+                    RaiseError(AutomationErrorSource.ActionReversion, "Revert action", exception, action);
+
                     // 跳过模式：忽略失败的回滚，继续执行剩余动作。
                 }
-                catch (Exception) when (
+                catch (Exception exception) when (
                     _exceptionHandleMode is WorkflowRunnerExceptionHandleMode.Interrupt)
                 {
+                    RaiseError(AutomationErrorSource.ActionReversion, "Revert action", exception, action);
+
                     // 中断模式：取消剩余回滚并重置动作状态机。
                     RequestInterruption();
                 }
@@ -692,6 +780,58 @@ public class WorkflowRunner : IAsyncDisposable
         }
     }
 
+    private object CreateInstance(Type type)
+    {
+        if (_serviceProvider is not null)
+        {
+            // 使用 DI 解析构造函数依赖，但始终创建新实例：
+            // 触发器和动作都是有状态的，不能由多个工作流共享。
+            return ActivatorUtilities.CreateInstance(_serviceProvider, type);
+        }
+
+        return Activator.CreateInstance(type)
+               ?? throw new InvalidOperationException(
+                   $"Failed to create instance of type '{type.FullName}'.");
+    }
+
+    private void ResetVerificationSource()
+    {
+        var previousVerificationSource = _verificationSource;
+
+        _verificationSource = new CancellationTokenSource();
+        previousVerificationSource.Dispose();
+    }
+
+    private void RaiseError(
+        AutomationErrorSource source,
+        string operation,
+        Exception exception,
+        ActionBase? action = null)
+    {
+        Debug.WriteLine($"[WorkflowRunner] {operation} failed: {exception}");
+
+        var handlers = ErrorOccurred;
+        if (handlers is null)
+        {
+            return;
+        }
+
+        var eventArgs = new AutomationErrorEventArgs(source, operation, exception, this, action);
+
+        foreach (var handler in handlers.GetInvocationList())
+        {
+            try
+            {
+                ((EventHandler<AutomationErrorEventArgs>)handler)(this, eventArgs);
+            }
+            catch (Exception handlerException)
+            {
+                // 错误订阅者自身出错时不能破坏工作流状态机。
+                Debug.WriteLine(handlerException);
+            }
+        }
+    }
+
     private static void SetProfile(TriggerBase trigger, TriggerProfileBase profile)
     {
         var profileProperty = trigger.GetType().GetProperty(
@@ -740,7 +880,10 @@ public class WorkflowRunner : IAsyncDisposable
             catch (Exception exception)
             {
                 // 单个订阅者出错不应破坏工作流状态机。
-                Debug.WriteLine(exception);
+                RaiseError(
+                    AutomationErrorSource.StatusChanged,
+                    "Notify status changed",
+                    exception);
             }
         }
     }
@@ -754,6 +897,15 @@ public class WorkflowRunner : IAsyncDisposable
         {
             if (_disposed) return;
             _disposed = true;
+        }
+
+        try
+        {
+            _verificationSource.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // 规则集验证已经结束并释放了取消源。
         }
 
         foreach (var trigger in _triggers)
@@ -773,7 +925,7 @@ public class WorkflowRunner : IAsyncDisposable
         var initializeLockTaken = false;
         try
         {
-            await _initializeLock.WaitAsync();
+            await _initializeLock.WaitAsync().ConfigureAwait(false);
             initializeLockTaken = true;
         }
         catch (ObjectDisposedException)
@@ -784,7 +936,7 @@ public class WorkflowRunner : IAsyncDisposable
         var triggerLockTaken = false;
         try
         {
-            await _triggerLock.WaitAsync();
+            await _triggerLock.WaitAsync().ConfigureAwait(false);
             triggerLockTaken = true;
         }
         catch (ObjectDisposedException)
@@ -802,11 +954,14 @@ public class WorkflowRunner : IAsyncDisposable
 
                 try
                 {
-                    await trigger.DisposeAsync();
+                    await trigger.DisposeAsync().ConfigureAwait(false);
                 }
                 catch (Exception exception)
                 {
-                    Debug.WriteLine(exception);
+                    RaiseError(
+                        AutomationErrorSource.Disposal,
+                        $"Dispose trigger '{trigger.GetType().FullName}'",
+                        exception);
                 }
             }
 
@@ -817,6 +972,8 @@ public class WorkflowRunner : IAsyncDisposable
         }
         finally
         {
+            _verificationSource.Dispose();
+
             if (triggerLockTaken)
             {
                 _triggerLock.Release();

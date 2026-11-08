@@ -58,6 +58,10 @@ internal sealed class FakeAutomationStorageService : IAutomationStorageService
 
     public Exception? LoadWorkflowsException { get; set; }
 
+    public TaskCompletionSource? LoadWorkflowsStarted { get; set; }
+
+    public TaskCompletionSource? LoadWorkflowsGate { get; set; }
+
     public string StoragePath => "/fake-storage";
 
     public string SerializeWorkflow(Workflow workflow)
@@ -80,9 +84,15 @@ internal sealed class FakeAutomationStorageService : IAutomationStorageService
         throw new NotSupportedException();
     }
 
-    public Task<IReadOnlyList<Workflow>> LoadWorkflowsAsync(CancellationToken cancellationToken = default)
+    public async Task<IReadOnlyList<Workflow>> LoadWorkflowsAsync(CancellationToken cancellationToken = default)
     {
         LoadWorkflowsCallCount++;
+        LoadWorkflowsStarted?.TrySetResult();
+
+        if (LoadWorkflowsGate is not null)
+        {
+            await LoadWorkflowsGate.Task.WaitAsync(cancellationToken);
+        }
 
         if (LoadWorkflowsException is not null)
         {
@@ -91,7 +101,7 @@ internal sealed class FakeAutomationStorageService : IAutomationStorageService
             throw exception;
         }
 
-        return Task.FromResult<IReadOnlyList<Workflow>>(Workflows.ToList());
+        return Workflows.ToList();
     }
 
     public bool WorkflowExists(Guid workflowId)

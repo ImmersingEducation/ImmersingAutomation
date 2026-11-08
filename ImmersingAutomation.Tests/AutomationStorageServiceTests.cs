@@ -1,4 +1,5 @@
 using ImmersingAutomation.Enums;
+using ImmersingAutomation.Events;
 using ImmersingAutomation.Models;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -17,10 +18,11 @@ public sealed class AutomationStorageServiceTests : IAsyncLifetime
     public Task InitializeAsync()
     {
         _automationService = new AutomationService(new FakeAutomationStorageService());
-        _automationService.ServiceCollection!.AddSingleton<TestTrigger>();
-        _automationService.ServiceCollection!.AddSingleton<TestRule>();
-        _automationService.ServiceCollection!.AddSingleton<TestAction>();
-        _storage = new AutomationStorageService(_automationService, _storagePath);
+        var services = _automationService.ServiceCollection!;
+        services.AddSingleton<TestTrigger>();
+        services.AddSingleton<TestRule>();
+        services.AddSingleton<TestAction>();
+        _storage = new AutomationStorageService(services, _storagePath);
 
         return Task.CompletedTask;
     }
@@ -40,7 +42,9 @@ public sealed class AutomationStorageServiceTests : IAsyncLifetime
     {
         var relativePath = Path.Combine(".", "storage");
 
-        var storage = new AutomationStorageService(_automationService, relativePath);
+        var storage = new AutomationStorageService(
+            _automationService.ServiceCollection!,
+            relativePath);
 
         Assert.Equal(Path.GetFullPath(relativePath), storage.StoragePath);
     }
@@ -49,9 +53,9 @@ public sealed class AutomationStorageServiceTests : IAsyncLifetime
     public void Constructor_RejectsInvalidArguments()
     {
         Assert.Throws<ArgumentNullException>(
-            () => new AutomationStorageService(null!, _storagePath));
+            () => new AutomationStorageService((AutomationTypeRegistry)null!, _storagePath));
         Assert.Throws<ArgumentException>(
-            () => new AutomationStorageService(_automationService, " "));
+            () => new AutomationStorageService(_automationService.ServiceCollection!, " "));
     }
 
     [Fact]
@@ -75,6 +79,8 @@ public sealed class AutomationStorageServiceTests : IAsyncLifetime
         var result = _storage.DeserializeWorkflow(json);
 
         Assert.Contains("\"$type\"", json);
+        Assert.Contains("\"Any\"", json);
+        Assert.Contains("\"Interrupt\"", json);
         Assert.Equal(workflow.Guid, result.Guid);
         Assert.Equal("Round trip", result.Name);
         Assert.True(result.IsReversionEnabled);
@@ -204,6 +210,61 @@ public sealed class AutomationStorageServiceTests : IAsyncLifetime
 
         await Assert.ThrowsAsync<OperationCanceledException>(
             () => _storage.DeleteWorkflowAsync(Guid.NewGuid(), cancellationSource.Token));
+    }
+
+    [Fact]
+    public async Task LoadWorkflowsAsync_WhenOneFileIsCorrupt_SkipsItAndRaisesError()
+    {
+        var workflow = CreatePersistableWorkflow();
+        await _storage.SaveWorkflowAsync(workflow);
+
+        var corruptFilePath = Path.Combine(_storagePath, $"{Guid.NewGuid():D}.json");
+        await File.WriteAllTextAsync(corruptFilePath, "{ this is not valid json");
+
+        var errors = new List<AutomationErrorEventArgs>();
+        _storage.ErrorOccurred += (_, eventArgs) => errors.Add(eventArgs);
+
+        var workflows = await _storage.LoadWorkflowsAsync();
+
+        Assert.Equal(workflow.Guid, Assert.Single(workflows).Guid);
+        var error = Assert.Single(errors);
+        Assert.Equal(AutomationErrorSource.Storage, error.Source);
+    }
+
+    [Fact]
+    public void DeserializeWorkflow_WhenSchemaVersionIsUnsupported_Throws()
+    {
+        var workflow = CreatePersistableWorkflow();
+        var json = _storage.SerializeWorkflow(workflow);
+        var unsupportedJson = json.Replace(
+            $"\"SchemaVersion\":{Workflow.CurrentSchemaVersion}",
+            "\"SchemaVersion\":999");
+
+        Assert.NotEqual(json, unsupportedJson);
+        Assert.Throws<System.Text.Json.JsonException>(
+            () => _storage.DeserializeWorkflow(unsupportedJson));
+    }
+
+    [Fact]
+    public async Task RealFileStorageAndAutomationService_CanBeWiredTogether()
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton<TestTrigger>();
+        services.AddSingleton<TestRule>();
+        services.AddSingleton<TestAction>();
+
+        var storagePath = Path.Combine(_storagePath, "integration");
+        var storage = new AutomationStorageService(services, storagePath);
+        await storage.SaveWorkflowAsync(CreatePersistableWorkflow());
+
+        await using var service = new AutomationService(storage, services)
+        {
+            TriggerPollInterval = TimeSpan.FromMinutes(1)
+        };
+
+        await service.InitializeAsync();
+
+        Assert.True(service.IsInitialized);
     }
 
     private static Workflow CreatePersistableWorkflow()

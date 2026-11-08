@@ -1,38 +1,57 @@
-using System.Reflection;
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using ImmersingAutomation.Abstractions;
-using ImmersingAutomation.Attributes;
+using ImmersingAutomation.Enums;
+using ImmersingAutomation.Events;
 using ImmersingAutomation.Models;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace ImmersingAutomation;
 
 /// <summary>
-/// 将工作流以 JSON 文件的形式存储在目录中，并使用关联 <see cref="AutomationService"/>
-/// 中注册的自动化类型进行还原。
+/// 将工作流以 JSON 文件的形式存储在目录中，并使用不可变的
+/// <see cref="AutomationTypeRegistry"/> 还原多态配置。
 /// </summary>
 public sealed class AutomationStorageService : IAutomationStorageService
 {
     private const string WorkflowFileExtension = ".json";
     private const string TypePropertyName = "$type";
 
-    private readonly AutomationService _automationService;
+    private readonly JsonSerializerOptions _jsonSerializerOptions;
 
     /// <summary>
     /// 初始化 <see cref="AutomationStorageService"/> 类的新实例。
     /// </summary>
-    /// <param name="automationService">其注册类型用于序列化的服务。</param>
+    /// <param name="typeRegistry">用于序列化多态配置的类型注册表。</param>
     /// <param name="storagePath">存储工作流的目录。</param>
-    public AutomationStorageService(AutomationService automationService, string storagePath)
+    public AutomationStorageService(AutomationTypeRegistry typeRegistry, string storagePath)
     {
-        ArgumentNullException.ThrowIfNull(automationService);
+        ArgumentNullException.ThrowIfNull(typeRegistry);
         ArgumentException.ThrowIfNullOrWhiteSpace(storagePath);
 
-        _automationService = automationService;
+        _jsonSerializerOptions = CreateJsonSerializerOptions(typeRegistry);
         StoragePath = Path.GetFullPath(storagePath);
     }
+
+    /// <summary>
+    /// 从服务集合中的自动化类型注册项创建存储服务。
+    /// </summary>
+    /// <param name="services">包含自动化类型注册项的服务集合。</param>
+    /// <param name="storagePath">存储工作流的目录。</param>
+    /// <remarks>
+    /// 注册表在构造时创建，因此之后向 <paramref name="services"/> 添加的类型不会被此实例识别。
+    /// </remarks>
+    public AutomationStorageService(IServiceCollection services, string storagePath)
+        : this(AutomationTypeRegistry.Create(services), storagePath)
+    {
+    }
+
+    /// <summary>
+    /// 当工作流文件无法加载或保存时发生。
+    /// </summary>
+    public event EventHandler<AutomationErrorEventArgs>? ErrorOccurred;
 
     /// <summary>
     /// 获取存储工作流的绝对目录。
@@ -48,7 +67,7 @@ public sealed class AutomationStorageService : IAutomationStorageService
     {
         ArgumentNullException.ThrowIfNull(workflow);
 
-        return SerializeWorkflow(workflow, CreateJsonSerializerOptions());
+        return JsonSerializer.Serialize(workflow, _jsonSerializerOptions);
     }
 
     /// <summary>
@@ -60,7 +79,17 @@ public sealed class AutomationStorageService : IAutomationStorageService
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(json);
 
-        return DeserializeWorkflow(json, CreateJsonSerializerOptions());
+        var workflow = JsonSerializer.Deserialize<Workflow>(json, _jsonSerializerOptions)
+                       ?? throw new JsonException("Failed to deserialize workflow.");
+
+        if (workflow.SchemaVersion is <= 0 or > Workflow.CurrentSchemaVersion)
+        {
+            throw new JsonException(
+                $"Unsupported workflow schema version '{workflow.SchemaVersion}'. " +
+                $"The supported version is '{Workflow.CurrentSchemaVersion}'.");
+        }
+
+        return workflow;
     }
 
     /// <summary>
@@ -75,21 +104,24 @@ public sealed class AutomationStorageService : IAutomationStorageService
         Directory.CreateDirectory(StoragePath);
 
         var filePath = GetWorkflowFilePath(workflow.Guid);
-        var temporaryFilePath = $"{filePath}.tmp";
-        var json = SerializeWorkflow(workflow, CreateJsonSerializerOptions());
+        var temporaryFilePath = $"{filePath}.{Guid.NewGuid():N}.tmp";
+        var json = SerializeWorkflow(workflow);
 
         try
         {
-            await File.WriteAllTextAsync(temporaryFilePath, json, Encoding.UTF8, cancellationToken);
+            await File.WriteAllTextAsync(temporaryFilePath, json, Encoding.UTF8, cancellationToken)
+                .ConfigureAwait(false);
             File.Move(temporaryFilePath, filePath, overwrite: true);
         }
-        catch
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            if (File.Exists(temporaryFilePath))
-            {
-                File.Delete(temporaryFilePath);
-            }
-
+            TryDelete(temporaryFilePath);
+            throw;
+        }
+        catch (Exception exception)
+        {
+            TryDelete(temporaryFilePath);
+            RaiseError("Save workflow", exception);
             throw;
         }
     }
@@ -108,15 +140,19 @@ public sealed class AutomationStorageService : IAutomationStorageService
             return null;
         }
 
-        var json = await File.ReadAllTextAsync(filePath, cancellationToken);
-        return DeserializeWorkflow(json, CreateJsonSerializerOptions());
+        var json = await File.ReadAllTextAsync(filePath, cancellationToken).ConfigureAwait(false);
+        return DeserializeWorkflow(json);
     }
 
     /// <summary>
-    /// 加载 <see cref="StoragePath"/> 中的每个工作流文件。
+    /// 加载 <see cref="StoragePath"/> 中的每个有效工作流文件。
     /// </summary>
     /// <param name="cancellationToken">用于取消操作的标记。</param>
     /// <returns>已存储的工作流；目录不存在时返回空列表。</returns>
+    /// <remarks>
+    /// 单个损坏的工作流文件会被跳过并引发 <see cref="ErrorOccurred"/>，
+    /// 不会阻止其他工作流加载。
+    /// </remarks>
     public async Task<IReadOnlyList<Workflow>> LoadWorkflowsAsync(CancellationToken cancellationToken = default)
     {
         if (!Directory.Exists(StoragePath))
@@ -125,12 +161,27 @@ public sealed class AutomationStorageService : IAutomationStorageService
         }
 
         var workflows = new List<Workflow>();
-        var jsonSerializerOptions = CreateJsonSerializerOptions();
 
         foreach (var filePath in Directory.EnumerateFiles(StoragePath, $"*{WorkflowFileExtension}"))
         {
-            var json = await File.ReadAllTextAsync(filePath, cancellationToken);
-            workflows.Add(DeserializeWorkflow(json, jsonSerializerOptions));
+            if (cancellationToken.IsCancellationRequested)
+            {
+                break;
+            }
+
+            try
+            {
+                var json = await File.ReadAllTextAsync(filePath, cancellationToken).ConfigureAwait(false);
+                workflows.Add(DeserializeWorkflow(json));
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                RaiseError($"Load workflow file '{filePath}'", exception);
+            }
         }
 
         return workflows;
@@ -170,29 +221,61 @@ public sealed class AutomationStorageService : IAutomationStorageService
         return Path.Combine(StoragePath, $"{workflowId:D}{WorkflowFileExtension}");
     }
 
-    private static string SerializeWorkflow(Workflow workflow, JsonSerializerOptions jsonSerializerOptions)
+    private static JsonSerializerOptions CreateJsonSerializerOptions(AutomationTypeRegistry typeRegistry)
     {
-        return JsonSerializer.Serialize(workflow, jsonSerializerOptions);
-    }
-
-    private static Workflow DeserializeWorkflow(string json, JsonSerializerOptions jsonSerializerOptions)
-    {
-        return JsonSerializer.Deserialize<Workflow>(json, jsonSerializerOptions)
-               ?? throw new JsonException("Failed to deserialize workflow.");
-    }
-
-    private JsonSerializerOptions CreateJsonSerializerOptions()
-    {
-        var typeRegistry = AutomationTypeRegistry.Create(_automationService.ServiceDescriptors);
-
         var options = new JsonSerializerOptions
         {
             PropertyNameCaseInsensitive = true
         };
 
+        // 使用字符串枚举，避免枚举成员重排后改变已存储数据的含义。
+        options.Converters.Add(new JsonStringEnumConverter());
         options.Converters.Add(new AutomationPolymorphicConverterFactory(typeRegistry));
 
         return options;
+    }
+
+    private static void TryDelete(string filePath)
+    {
+        try
+        {
+            if (File.Exists(filePath))
+            {
+                File.Delete(filePath);
+            }
+        }
+        catch (Exception exception)
+        {
+            Debug.WriteLine(exception);
+        }
+    }
+
+    private void RaiseError(string operation, Exception exception)
+    {
+        Debug.WriteLine($"[AutomationStorageService] {operation} failed: {exception}");
+
+        var handlers = ErrorOccurred;
+        if (handlers is null)
+        {
+            return;
+        }
+
+        var eventArgs = new AutomationErrorEventArgs(
+            AutomationErrorSource.Storage,
+            operation,
+            exception);
+
+        foreach (var handler in handlers.GetInvocationList())
+        {
+            try
+            {
+                ((EventHandler<AutomationErrorEventArgs>)handler)(this, eventArgs);
+            }
+            catch (Exception handlerException)
+            {
+                Debug.WriteLine(handlerException);
+            }
+        }
     }
 
     private sealed class AutomationPolymorphicConverterFactory : JsonConverterFactory
@@ -286,357 +369,6 @@ public sealed class AutomationStorageService : IAutomationStorageService
             var concreteType = _typeRegistry.GetConcreteType<TBase>(typeId);
 
             return (TBase?)JsonSerializer.Deserialize(element.GetRawText(), concreteType, options);
-        }
-    }
-
-    private sealed class AutomationTypeRegistry
-    {
-        private readonly Dictionary<Guid, Type> _triggerTypes = new();
-        private readonly Dictionary<Guid, Type> _ruleTypes = new();
-        private readonly Dictionary<Guid, Type> _actionTypes = new();
-
-        private readonly Dictionary<Type, Guid> _triggerProfileTypeIds = new();
-        private readonly Dictionary<Type, Guid> _actionProfileTypeIds = new();
-        private readonly Dictionary<Type, Guid> _ruleProfileTypeIds = new();
-        private readonly Dictionary<Type, Guid> _ruleTypeIds = new();
-
-        private readonly Dictionary<Guid, Type> _triggerProfileTypes = new();
-        private readonly Dictionary<Guid, Type> _actionProfileTypes = new();
-        private readonly Dictionary<Guid, Type> _ruleProfileTypes = new();
-
-        public static AutomationTypeRegistry Create(IEnumerable<ServiceDescriptor> descriptors)
-        {
-            var registry = new AutomationTypeRegistry();
-            var implementationTypes = new HashSet<Type>();
-
-            foreach (var descriptor in descriptors)
-            {
-                AddImplementationType(implementationTypes, descriptor.ImplementationType);
-                AddImplementationType(implementationTypes, descriptor.ImplementationInstance?.GetType());
-                AddImplementationType(implementationTypes, descriptor.ServiceType);
-            }
-
-            foreach (var implementationType in implementationTypes)
-            {
-                registry.Register(implementationType);
-            }
-
-            return registry;
-        }
-
-        private static void AddImplementationType(ISet<Type> implementationTypes, Type? implementationType)
-        {
-            if (implementationType is null
-                || implementationType.IsAbstract
-                || implementationType.IsInterface
-                || implementationType.IsGenericTypeDefinition)
-            {
-                return;
-            }
-
-            implementationTypes.Add(implementationType);
-        }
-
-        private void Register(Type implementationType)
-        {
-            RegisterProfile(implementationType);
-
-            var triggerAttribute = implementationType.GetCustomAttribute<TriggerAttribute>(inherit: false);
-            if (triggerAttribute is not null && typeof(TriggerBase).IsAssignableFrom(implementationType))
-            {
-                Add(_triggerTypes, triggerAttribute.Guid, implementationType, "trigger");
-
-                var profileType = GetGenericArgument(implementationType, typeof(TriggerBase<>));
-                if (profileType is not null)
-                {
-                    Add(_triggerProfileTypeIds, profileType, triggerAttribute.Guid, "trigger profile");
-                }
-            }
-
-            var ruleAttribute = implementationType.GetCustomAttribute<RuleAttribute>(inherit: false);
-            if (ruleAttribute is not null && typeof(RuleBase).IsAssignableFrom(implementationType))
-            {
-                Add(_ruleTypes, ruleAttribute.Guid, implementationType, "rule");
-                Add(_ruleTypeIds, implementationType, ruleAttribute.Guid, "rule");
-
-                var profileType = GetGenericArgument(implementationType, typeof(RuleBase<>));
-                if (profileType is not null)
-                {
-                    Add(_ruleProfileTypeIds, profileType, ruleAttribute.Guid, "rule profile");
-                }
-            }
-
-            var actionAttribute = implementationType.GetCustomAttribute<ActionAttribute>(inherit: false);
-            if (actionAttribute is not null && typeof(ActionBase).IsAssignableFrom(implementationType))
-            {
-                Add(_actionTypes, actionAttribute.Guid, implementationType, "action");
-
-                var profileType = GetGenericArgument(implementationType, typeof(ActionBase<>));
-                if (profileType is not null)
-                {
-                    Add(_actionProfileTypeIds, profileType, actionAttribute.Guid, "action profile");
-                }
-            }
-        }
-
-        private void RegisterProfile(Type implementationType)
-        {
-            if (typeof(TriggerProfileBase).IsAssignableFrom(implementationType))
-            {
-                var profileAttribute = implementationType.GetCustomAttribute<TriggerProfileAttribute>(inherit: false);
-                if (profileAttribute is not null)
-                {
-                    var triggerAttribute = GetRequiredAttribute<TriggerAttribute>(
-                        profileAttribute.TriggerType,
-                        "trigger",
-                        implementationType);
-
-                    Add(_triggerProfileTypeIds, implementationType, triggerAttribute.Guid, "trigger profile");
-                    Add(_triggerProfileTypes, triggerAttribute.Guid, implementationType, "trigger profile");
-                }
-            }
-
-            if (typeof(ActionProfileBase).IsAssignableFrom(implementationType))
-            {
-                var profileAttribute = implementationType.GetCustomAttribute<ActionProfileAttribute>(inherit: false);
-                if (profileAttribute is not null)
-                {
-                    var actionAttribute = GetRequiredAttribute<ActionAttribute>(
-                        profileAttribute.ActionType,
-                        "action",
-                        implementationType);
-
-                    Add(_actionProfileTypeIds, implementationType, actionAttribute.Guid, "action profile");
-                    Add(_actionProfileTypes, actionAttribute.Guid, implementationType, "action profile");
-                }
-            }
-
-            if (typeof(RuleProfileBase).IsAssignableFrom(implementationType))
-            {
-                var profileAttribute = implementationType.GetCustomAttribute<RuleProfileAttribute>(inherit: false);
-                if (profileAttribute is not null)
-                {
-                    var ruleAttribute = GetRequiredAttribute<RuleAttribute>(
-                        profileAttribute.RuleType,
-                        "rule",
-                        implementationType);
-
-                    Add(_ruleProfileTypeIds, implementationType, ruleAttribute.Guid, "rule profile");
-                    Add(_ruleProfileTypes, ruleAttribute.Guid, implementationType, "rule profile");
-                }
-            }
-        }
-
-        private static TAttribute GetRequiredAttribute<TAttribute>(
-            Type targetType,
-            string kind,
-            Type profileType) where TAttribute : Attribute
-        {
-            return targetType.GetCustomAttribute<TAttribute>(inherit: false)
-                   ?? throw new InvalidOperationException(
-                       $"{kind} profile type '{profileType.FullName}' references {kind} type " +
-                       $"'{targetType.FullName}' which has no [{typeof(TAttribute).Name}].");
-        }
-
-        public Guid GetTypeId<TBase>(Type concreteType) where TBase : class
-        {
-            var baseType = typeof(TBase);
-
-            if (baseType == typeof(TriggerProfileBase))
-            {
-                if (_triggerProfileTypeIds.TryGetValue(concreteType, out var triggerTypeId))
-                {
-                    return triggerTypeId;
-                }
-
-                var profileAttribute = concreteType.GetCustomAttribute<TriggerProfileAttribute>(inherit: false);
-                if (profileAttribute is not null)
-                {
-                    return GetRequiredAttribute<TriggerAttribute>(
-                        profileAttribute.TriggerType,
-                        "trigger",
-                        concreteType).Guid;
-                }
-
-                var triggerAttribute = concreteType.GetCustomAttribute<TriggerAttribute>(inherit: false);
-                if (triggerAttribute is not null)
-                {
-                    return triggerAttribute.Guid;
-                }
-
-                throw new InvalidOperationException(
-                    $"Trigger profile type '{concreteType.FullName}' is not associated with a registered trigger. " +
-                    $"Make sure the corresponding trigger implementation is registered and has a [{nameof(TriggerAttribute)}], " +
-                    $"or annotate the profile with a [{nameof(TriggerProfileAttribute)}].");
-            }
-
-            if (baseType == typeof(ActionProfileBase))
-            {
-                if (_actionProfileTypeIds.TryGetValue(concreteType, out var actionTypeId))
-                {
-                    return actionTypeId;
-                }
-
-                var profileAttribute = concreteType.GetCustomAttribute<ActionProfileAttribute>(inherit: false);
-                if (profileAttribute is not null)
-                {
-                    return GetRequiredAttribute<ActionAttribute>(
-                        profileAttribute.ActionType,
-                        "action",
-                        concreteType).Guid;
-                }
-
-                var actionAttribute = concreteType.GetCustomAttribute<ActionAttribute>(inherit: false);
-                if (actionAttribute is not null)
-                {
-                    return actionAttribute.Guid;
-                }
-
-                throw new InvalidOperationException(
-                    $"Action profile type '{concreteType.FullName}' is not associated with a registered action. " +
-                    $"Make sure the corresponding action implementation is registered and has a [{nameof(ActionAttribute)}], " +
-                    $"or annotate the profile with a [{nameof(ActionProfileAttribute)}].");
-            }
-
-            if (baseType == typeof(RuleProfileBase))
-            {
-                if (_ruleProfileTypeIds.TryGetValue(concreteType, out var ruleTypeId))
-                {
-                    return ruleTypeId;
-                }
-
-                var profileAttribute = concreteType.GetCustomAttribute<RuleProfileAttribute>(inherit: false);
-                if (profileAttribute is not null)
-                {
-                    return GetRequiredAttribute<RuleAttribute>(
-                        profileAttribute.RuleType,
-                        "rule",
-                        concreteType).Guid;
-                }
-
-                throw new InvalidOperationException(
-                    $"Rule profile type '{concreteType.FullName}' is not associated with a registered rule. " +
-                    $"Make sure the corresponding rule implementation is registered and has a [{nameof(RuleAttribute)}], " +
-                    $"or annotate the profile with a [{nameof(RuleProfileAttribute)}].");
-            }
-
-            if (baseType == typeof(RuleBase))
-            {
-                if (_ruleTypeIds.TryGetValue(concreteType, out var ruleTypeId))
-                {
-                    return ruleTypeId;
-                }
-
-                var ruleAttribute = concreteType.GetCustomAttribute<RuleAttribute>(inherit: false);
-                if (ruleAttribute is not null)
-                {
-                    return ruleAttribute.Guid;
-                }
-
-                throw new InvalidOperationException(
-                    $"Rule type '{concreteType.FullName}' is not registered and has no [{nameof(RuleAttribute)}].");
-            }
-
-            throw new NotSupportedException($"Unsupported polymorphic automation type '{baseType}'.");
-        }
-
-        public Type GetConcreteType<TBase>(Guid typeId) where TBase : class
-        {
-            var baseType = typeof(TBase);
-
-            if (baseType == typeof(TriggerProfileBase))
-            {
-                return _triggerProfileTypes.TryGetValue(typeId, out var triggerProfileType)
-                    ? triggerProfileType
-                    : GetProfileType(_triggerTypes, typeId, typeof(TriggerBase<>), "trigger");
-            }
-
-            if (baseType == typeof(ActionProfileBase))
-            {
-                return _actionProfileTypes.TryGetValue(typeId, out var actionProfileType)
-                    ? actionProfileType
-                    : GetProfileType(_actionTypes, typeId, typeof(ActionBase<>), "action");
-            }
-
-            if (baseType == typeof(RuleProfileBase))
-            {
-                return _ruleProfileTypes.TryGetValue(typeId, out var ruleProfileType)
-                    ? ruleProfileType
-                    : GetProfileType(_ruleTypes, typeId, typeof(RuleBase<>), "rule");
-            }
-
-            if (baseType == typeof(RuleBase))
-            {
-                if (_ruleTypes.TryGetValue(typeId, out var ruleType))
-                {
-                    return ruleType;
-                }
-
-                throw new JsonException($"No rule implementation is registered for Guid '{typeId}'.");
-            }
-
-            throw new NotSupportedException($"Unsupported polymorphic automation type '{baseType}'.");
-        }
-
-        private static Type GetProfileType(
-            IReadOnlyDictionary<Guid, Type> implementationTypes,
-            Guid typeId,
-            Type openGenericBaseType,
-            string kind)
-        {
-            if (!implementationTypes.TryGetValue(typeId, out var implementationType))
-            {
-                throw new JsonException($"No {kind} implementation is registered for Guid '{typeId}'.");
-            }
-
-            return GetGenericArgument(implementationType, openGenericBaseType)
-                   ?? throw new JsonException(
-                       $"The registered {kind} implementation '{implementationType.FullName}' does not define a profile type.");
-        }
-
-        private static Type? GetGenericArgument(Type type, Type openGenericBaseType)
-        {
-            for (var current = type.BaseType; current is not null; current = current.BaseType)
-            {
-                if (current.IsGenericType && current.GetGenericTypeDefinition() == openGenericBaseType)
-                {
-                    return current.GetGenericArguments()[0];
-                }
-            }
-
-            return null;
-        }
-
-        private static void Add<TKey>(
-            IDictionary<TKey, Type> dictionary,
-            TKey key,
-            Type value,
-            string kind) where TKey : notnull
-        {
-            if (dictionary.TryGetValue(key, out var existingValue) && existingValue != value)
-            {
-                throw new InvalidOperationException(
-                    $"Multiple {kind} implementations are registered for the same key: " +
-                    $"'{existingValue.FullName}' and '{value.FullName}'.");
-            }
-
-            dictionary[key] = value;
-        }
-
-        private static void Add<TKey>(
-            IDictionary<TKey, Guid> dictionary,
-            TKey key,
-            Guid value,
-            string kind) where TKey : notnull
-        {
-            if (dictionary.TryGetValue(key, out var existingValue) && existingValue != value)
-            {
-                throw new InvalidOperationException(
-                    $"Multiple {kind} identifiers are registered for the same type: " +
-                    $"'{existingValue}' and '{value}'.");
-            }
-
-            dictionary[key] = value;
         }
     }
 }

@@ -82,7 +82,7 @@ public abstract class TriggerBase : IAsyncDisposable
     /// <exception cref="InvalidOperationException">无法从当前状态初始化触发器。</exception>
     public async Task InitializeAsync()
     {
-        await _lifecycleLock.WaitAsync();
+        await _lifecycleLock.WaitAsync().ConfigureAwait(false);
 
         try
         {
@@ -107,7 +107,7 @@ public abstract class TriggerBase : IAsyncDisposable
 
             try
             {
-                await _InitializeAsync();
+                await _InitializeAsync().ConfigureAwait(false);
             }
             catch
             {
@@ -128,11 +128,11 @@ public abstract class TriggerBase : IAsyncDisposable
     /// </summary>
     public async Task ReleaseAsync()
     {
-        await _lifecycleLock.WaitAsync();
+        await _lifecycleLock.WaitAsync().ConfigureAwait(false);
 
         try
         {
-            await ReleaseCoreAsync();
+            await ReleaseCoreAsync().ConfigureAwait(false);
         }
         finally
         {
@@ -145,7 +145,7 @@ public abstract class TriggerBase : IAsyncDisposable
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        await _lifecycleLock.WaitAsync();
+        await _lifecycleLock.WaitAsync().ConfigureAwait(false);
 
         try
         {
@@ -157,7 +157,7 @@ public abstract class TriggerBase : IAsyncDisposable
                 }
             }
 
-            await ReleaseCoreAsync();
+            await ReleaseCoreAsync().ConfigureAwait(false);
         }
         finally
         {
@@ -198,7 +198,7 @@ public abstract class TriggerBase : IAsyncDisposable
 
         try
         {
-            await _ReleaseAsync();
+            await _ReleaseAsync().ConfigureAwait(false);
         }
         catch
         {

@@ -9,9 +9,19 @@ namespace ImmersingAutomation.Models;
 public class Workflow
 {
     /// <summary>
+    /// 当前支持的工作流持久化架构版本。
+    /// </summary>
+    public const int CurrentSchemaVersion = 1;
+
+    /// <summary>
     /// 获取工作流的唯一标识符。
     /// </summary>
     public Guid Guid { get; init; } = Guid.NewGuid();
+
+    /// <summary>
+    /// 获取工作流的持久化架构版本。
+    /// </summary>
+    public int SchemaVersion { get; init; } = CurrentSchemaVersion;
     
     /// <summary>
     /// 获取或设置工作流的显示名称。

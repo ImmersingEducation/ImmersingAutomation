@@ -12,7 +12,8 @@ public class Ruleset : RuleBase<RulesetProfile>
     /// 当 <see cref="RulesetProfile.Mode"/> 为 <see cref="RulesetMode.All"/> 时验证所有规则，
     /// 否则验证到有一条规则匹配为止。
     /// </summary>
-    protected override async Task<bool> _ValidateAsync()
+    /// <param name="cancellationToken">用于取消操作的标记。</param>
+    protected override async Task<bool> _ValidateAsync(CancellationToken cancellationToken)
     {
         var rules = Profile.Rules ?? [];
 
@@ -20,7 +21,7 @@ public class Ruleset : RuleBase<RulesetProfile>
         {
             foreach (var rule in rules)
             {
-                if (!await rule.ValidateAsync())
+                if (!await rule.ValidateAsync(cancellationToken).ConfigureAwait(false))
                 {
                     return false;
                 }
@@ -31,7 +32,7 @@ public class Ruleset : RuleBase<RulesetProfile>
 
         foreach (var rule in rules)
         {
-            if (await rule.ValidateAsync())
+            if (await rule.ValidateAsync(cancellationToken).ConfigureAwait(false))
             {
                 return true;
             }

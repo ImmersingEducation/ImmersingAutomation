@@ -112,6 +112,17 @@ public class RulesetTests
         Assert.Same(profile, rule.Profile);
     }
 
+    [Fact]
+    public async Task ValidateAsync_WhenCancelled_Throws()
+    {
+        var ruleset = CreateRuleset(RulesetMode.All, TestWorkflows.CreateRule(true));
+        using var cancellationSource = new CancellationTokenSource();
+        await cancellationSource.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => ruleset.ValidateAsync(cancellationSource.Token));
+    }
+
     private static Ruleset CreateRuleset(RulesetMode mode, params RuleBase[] rules)
     {
         return new Ruleset

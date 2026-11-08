@@ -79,8 +79,9 @@ public sealed class TestRuleProfile : RuleProfileBase
 [Rule("7f9619ff-8b86-d011-b42d-00cf4fc964ff", "Test rule")]
 public sealed class TestRule : RuleBase<TestRuleProfile>
 {
-    protected override Task<bool> _ValidateAsync()
+    protected override Task<bool> _ValidateAsync(CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         Profile.ValidateCount++;
         return Task.FromResult(Profile.Validator?.Invoke() ?? Profile.Result);
     }
@@ -203,8 +204,9 @@ public sealed class UnattributedActionProfile : ActionProfileBase
 
 public sealed class UnregisteredRule : RuleBase
 {
-    protected override Task<bool> _ValidateAsync()
+    protected override Task<bool> _ValidateAsync(CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         return Task.FromResult(true);
     }
 }
@@ -242,5 +244,65 @@ public sealed class OtherAction : ActionBase<TestActionProfile>
     protected override Task _RevertAsync()
     {
         return Task.CompletedTask;
+    }
+}
+
+[ActionProfile(typeof(NonReversibleAction))]
+public sealed class NonReversibleActionProfile : ActionProfileBase
+{
+}
+
+[Action("9f9619ff-8b86-d011-b42d-00cf4fc964ff", "Non-reversible action", isReversionSupported: false)]
+public sealed class NonReversibleAction : ActionBase<NonReversibleActionProfile>
+{
+    protected override Task _RunAsync()
+    {
+        return Task.CompletedTask;
+    }
+
+    protected override Task _RevertAsync()
+    {
+        return Task.CompletedTask;
+    }
+}
+
+public sealed class TestDependency
+{
+    public int Value { get; } = 42;
+}
+
+[TriggerProfile(typeof(DependencyTrigger))]
+public sealed class DependencyTriggerProfile : TriggerProfileBase
+{
+}
+
+[Trigger("af9619ff-8b86-d011-b42d-00cf4fc964ff", "Dependency trigger")]
+public sealed class DependencyTrigger : TriggerBase<DependencyTriggerProfile>
+{
+    public DependencyTrigger(TestDependency dependency)
+    {
+        Dependency = dependency;
+    }
+
+    public TestDependency Dependency { get; }
+
+    protected override Task _InitializeAsync()
+    {
+        return Task.CompletedTask;
+    }
+
+    protected override Task _ReleaseAsync()
+    {
+        return Task.CompletedTask;
+    }
+}
+
+public sealed class DisposableSingleton : IDisposable
+{
+    public bool IsDisposed { get; private set; }
+
+    public void Dispose()
+    {
+        IsDisposed = true;
     }
 }
