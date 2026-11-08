@@ -385,6 +385,31 @@ public class AutomationServiceTests
     }
 
     [Fact]
+    public async Task InitializeAsync_WhenWorkflowFailsAndFailFastIsDisabled_SkipsItAndContinues()
+    {
+        var validProfile = new TestTriggerProfile();
+        var storage = new FakeAutomationStorageService();
+        storage.Workflows.Add(TestWorkflows.Create(validProfile, isEnabled: true));
+        storage.Workflows.Add(TestWorkflows.Create(new UnattributedTriggerProfile(), isEnabled: true));
+
+        await using var service = new AutomationService(storage)
+        {
+            FailFastOnWorkflowInitializationError = false,
+            TriggerPollInterval = TimeSpan.FromMinutes(1)
+        };
+
+        AutomationErrorEventArgs? error = null;
+        service.ErrorOccurred += (_, eventArgs) => error ??= eventArgs;
+
+        await service.InitializeAsync();
+
+        Assert.True(service.IsInitialized);
+        Assert.Equal(1, validProfile.InitializeCount);
+        Assert.NotNull(error);
+        Assert.Equal(AutomationErrorSource.Workflow, error.Source);
+    }
+
+    [Fact]
     public async Task DisposeAsync_DisposesOwnedServiceProvider()
     {
         var services = new Microsoft.Extensions.DependencyInjection.ServiceCollection();

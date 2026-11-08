@@ -116,6 +116,15 @@ public class AutomationService : IAsyncDisposable
     }
 
     /// <summary>
+    /// 获取或设置单个工作流初始化失败时是否中止整个服务的初始化。
+    /// </summary>
+    /// <remarks>
+    /// 默认值为 <see langword="true"/>。设置为 <see langword="false"/> 时，失败的工作流会被跳过，
+    /// 其余工作流继续初始化；失败信息仍会通过 <see cref="ErrorOccurred"/> 引发。
+    /// </remarks>
+    public bool FailFastOnWorkflowInitializationError { get; init; } = true;
+
+    /// <summary>
     /// 获取或设置用于构建服务提供程序的服务集合；服务初始化后为 <see langword="null"/>。
     /// </summary>
     public IServiceCollection? ServiceCollection
@@ -201,7 +210,22 @@ public class AutomationService : IAsyncDisposable
             foreach (var workflow in _workflows.Where(workflow => workflow.IsEnabled))
             {
                 processedWorkflows.Add(workflow);
-                await AddWorkflowRunner(workflow).ConfigureAwait(false);
+
+                if (FailFastOnWorkflowInitializationError)
+                {
+                    await AddWorkflowRunner(workflow).ConfigureAwait(false);
+                    continue;
+                }
+
+                try
+                {
+                    await AddWorkflowRunner(workflow).ConfigureAwait(false);
+                }
+                catch (Exception exception)
+                {
+                    // AddWorkflowRunner 已清理运行器并引发错误事件；跳过该工作流继续初始化。
+                    Debug.WriteLine(exception);
+                }
             }
 
             StartTriggerQueryLoop();
