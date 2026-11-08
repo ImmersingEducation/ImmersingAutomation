@@ -191,6 +191,13 @@ dotnet test
 dotnet pack ImmersingAutomation/ImmersingAutomation.csproj -c Release -o ./artifacts
 ```
 
+## 发布
+
+推送形如 `v0.1.0-beta.1` 的 tag 会触发 [`.github/workflows/publish.yml`](.github/workflows/publish.yml)：
+自动构建、测试、打包，推送到 NuGet.org，并创建对应的 GitHub Release（含 `.nupkg` / `.snupkg`）。
+
+仓库需要配置 secret **`NUGET_API_KEY`**。也可以手动触发工作流并填写版本号。
+
 ## 许可证
 
 [MIT](LICENSE) © 2026 ImmersingEducation
