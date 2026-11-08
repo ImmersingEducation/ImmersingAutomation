@@ -12,4 +12,8 @@ public class TriggerAttribute : Attribute
         Guid = guid;
         Name = name;
     }
+
+    public TriggerAttribute(string guid, string name) : this(Guid.Parse(guid), name)
+    {
+    }
 }

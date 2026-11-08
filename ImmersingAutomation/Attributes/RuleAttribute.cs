@@ -11,4 +11,8 @@ public class RuleAttribute : Attribute
         Guid = guid;
         Name = name;
     }
+
+    public RuleAttribute(string guid, string name) : this(Guid.Parse(guid), name)
+    {
+    }
 }

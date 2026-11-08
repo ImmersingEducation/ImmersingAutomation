@@ -13,4 +13,9 @@ public class ActionAttribute : Attribute
         Name = name;
         IsReversionSupported = isReversionSupported;
     }
+
+    public ActionAttribute(string guid, string name, bool isReversionSupported)
+        : this(Guid.Parse(guid), name, isReversionSupported)
+    {
+    }
 }
