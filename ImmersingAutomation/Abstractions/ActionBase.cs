@@ -23,7 +23,7 @@ public abstract class ActionBase
     public abstract Task RevertAsync();
 }
 
-public abstract class ActionBase<T> : ActionBase where T : class
+public abstract class ActionBase<T> : ActionBase where T : ActionProfileBase
 {
     public T Profile => (_profile as T)!;
 }

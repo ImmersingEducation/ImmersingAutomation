@@ -16,7 +16,7 @@ public abstract class TriggerBase
     public abstract Task Release();
 }
 
-public abstract class TriggerBase<T> : TriggerBase where T : class
+public abstract class TriggerBase<T> : TriggerBase where T : TriggerProfileBase
 {
     public T Profile => (_profile as T)!;
 }
