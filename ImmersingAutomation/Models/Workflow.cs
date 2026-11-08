@@ -1,4 +1,5 @@
 using ImmersingAutomation.Abstractions;
+using ImmersingAutomation.Enums;
 
 namespace ImmersingAutomation.Models;
 
@@ -17,4 +18,6 @@ public class Workflow
     public List<ActionProfileBase> ActionProfiles { get; set; }
     
     public bool IsReversionEnabled { get; set; }
+    
+    public WorkflowRunnerExceptionHandleMode ExceptionHandleMode { get; set; }
 }

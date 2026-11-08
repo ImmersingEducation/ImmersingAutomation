@@ -12,6 +12,8 @@ public abstract class ActionBase
 
     private CancellationTokenSource _interruptionSource = new();
 
+    private int _operationVersion;
+
     public ActionStatus Status
     {
         get
@@ -78,6 +80,7 @@ public abstract class ActionBase
     public async Task RunAsync(bool isReversionNeeded)
     {
         CancellationToken interruptionToken;
+        int operationVersion;
 
         lock (_statusLock)
         {
@@ -85,6 +88,7 @@ public abstract class ActionBase
 
             ResetInterruptionSource();
             _status = ActionStatus.Running;
+            operationVersion = ++_operationVersion;
             interruptionToken = _interruptionSource.Token;
         }
 
@@ -101,14 +105,18 @@ public abstract class ActionBase
         {
             lock (_statusLock)
             {
-                if (isReversionNeeded)
+                // A forced reset supersedes this operation, so it must not restore the old state.
+                if (_operationVersion == operationVersion)
                 {
-                    _status = ActionStatus.WaitingForReversion;
-                }
-                else
-                {
-                    ResetInterruptionSource();
-                    _status = ActionStatus.WaitingForRunning;
+                    if (isReversionNeeded)
+                    {
+                        _status = ActionStatus.WaitingForReversion;
+                    }
+                    else
+                    {
+                        ResetInterruptionSource();
+                        _status = ActionStatus.WaitingForRunning;
+                    }
                 }
             }
         }
@@ -117,6 +125,7 @@ public abstract class ActionBase
     public async Task RevertAsync()
     {
         CancellationToken interruptionToken;
+        int operationVersion;
 
         lock (_statusLock)
         {
@@ -124,6 +133,7 @@ public abstract class ActionBase
 
             ResetInterruptionSource();
             _status = ActionStatus.Reverting;
+            operationVersion = ++_operationVersion;
             interruptionToken = _interruptionSource.Token;
         }
 
@@ -140,8 +150,12 @@ public abstract class ActionBase
         {
             lock (_statusLock)
             {
-                ResetInterruptionSource();
-                _status = ActionStatus.WaitingForRunning;
+                // A forced reset supersedes this operation, so it must not restore the old state.
+                if (_operationVersion == operationVersion)
+                {
+                    ResetInterruptionSource();
+                    _status = ActionStatus.WaitingForRunning;
+                }
             }
         }
     }
@@ -156,9 +170,43 @@ public abstract class ActionBase
         {
             EnsureStatus(ActionStatus.WaitingForReversion, nameof(Reset));
 
+            _operationVersion++;
             ResetInterruptionSource();
             _status = ActionStatus.WaitingForRunning;
         }
+    }
+
+    /// <summary>
+    /// Resets the action to the idle state regardless of its current status.
+    /// If an operation is still running, it is cancelled and its final state transition is ignored.
+    /// </summary>
+    public void ForceReset()
+    {
+        CancellationTokenSource interruptionSource;
+
+        lock (_statusLock)
+        {
+            if (_status is ActionStatus.WaitingForRunning)
+            {
+                return;
+            }
+
+            _operationVersion++;
+            interruptionSource = _interruptionSource;
+            _interruptionSource = new CancellationTokenSource();
+            _status = ActionStatus.WaitingForRunning;
+        }
+
+        try
+        {
+            interruptionSource.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // The operation already finished and disposed its source.
+        }
+
+        interruptionSource.Dispose();
     }
 
     protected abstract Task _RunAsync();
