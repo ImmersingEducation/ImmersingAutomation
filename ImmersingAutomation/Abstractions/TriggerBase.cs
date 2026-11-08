@@ -14,7 +14,7 @@ public abstract class TriggerBase : IAsyncDisposable
     /// <summary>
     /// 获取或设置由泛型派生类提供的配置对象。
     /// </summary>
-    protected object _profile { get; set; }
+    protected object _profile { get; set; } = null!;
 
     private readonly object _statusLock = new();
 

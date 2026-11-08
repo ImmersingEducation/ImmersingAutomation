@@ -10,6 +10,11 @@ public class WorkflowTests
         Assert.NotEqual(Guid.Empty, workflow.Guid);
         Assert.False(workflow.IsEnabled);
         Assert.False(workflow.IsReversionEnabled);
+        Assert.Equal(string.Empty, workflow.Name);
+        Assert.Empty(workflow.TriggerProfiles);
+        Assert.Empty(workflow.ActionProfiles);
+        Assert.NotNull(workflow.RulesetProfile);
+        Assert.Empty(workflow.RulesetProfile.Rules);
     }
 
     [Fact]

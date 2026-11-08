@@ -14,7 +14,7 @@ public abstract class ActionBase
     /// <summary>
     /// 获取或设置由泛型派生类提供的配置对象。
     /// </summary>
-    protected object _profile;
+    protected object _profile = null!;
 
     private readonly object _statusLock = new();
 

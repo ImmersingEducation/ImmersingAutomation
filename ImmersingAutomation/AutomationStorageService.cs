@@ -89,7 +89,63 @@ public sealed class AutomationStorageService : IAutomationStorageService
                 $"The supported version is '{Workflow.CurrentSchemaVersion}'.");
         }
 
+        ValidateWorkflow(workflow);
+
         return workflow;
+    }
+
+    private static void ValidateWorkflow(Workflow workflow)
+    {
+        // 显式的 null 会覆盖属性初始值，因此必须在反序列化后校验，
+        // 避免运行期出现难以定位的 NullReferenceException。
+        if (workflow.Name is null)
+        {
+            throw new JsonException($"Workflow property '{nameof(Workflow.Name)}' cannot be null.");
+        }
+
+        if (workflow.TriggerProfiles is null)
+        {
+            throw new JsonException(
+                $"Workflow property '{nameof(Workflow.TriggerProfiles)}' cannot be null.");
+        }
+
+        if (workflow.ActionProfiles is null)
+        {
+            throw new JsonException(
+                $"Workflow property '{nameof(Workflow.ActionProfiles)}' cannot be null.");
+        }
+
+        if (workflow.RulesetProfile is null)
+        {
+            throw new JsonException(
+                $"Workflow property '{nameof(Workflow.RulesetProfile)}' cannot be null.");
+        }
+
+        if (workflow.RulesetProfile.Rules is null)
+        {
+            throw new JsonException(
+                $"Workflow property '{nameof(Workflow.RulesetProfile)}.{nameof(RulesetProfile.Rules)}' " +
+                "cannot be null.");
+        }
+
+        if (workflow.TriggerProfiles.Any(static profile => profile is null))
+        {
+            throw new JsonException(
+                $"Workflow property '{nameof(Workflow.TriggerProfiles)}' cannot contain null entries.");
+        }
+
+        if (workflow.ActionProfiles.Any(static profile => profile is null))
+        {
+            throw new JsonException(
+                $"Workflow property '{nameof(Workflow.ActionProfiles)}' cannot contain null entries.");
+        }
+
+        if (workflow.RulesetProfile.Rules.Any(static rule => rule is null))
+        {
+            throw new JsonException(
+                $"Workflow property '{nameof(Workflow.RulesetProfile)}.{nameof(RulesetProfile.Rules)}' " +
+                "cannot contain null entries.");
+        }
     }
 
     /// <summary>

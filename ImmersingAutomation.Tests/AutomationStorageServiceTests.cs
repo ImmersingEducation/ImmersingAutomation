@@ -246,6 +246,37 @@ public sealed class AutomationStorageServiceTests : IAsyncLifetime
     }
 
     [Fact]
+    public void DeserializeWorkflow_WhenRequiredPropertyIsNull_Throws()
+    {
+        var workflow = CreatePersistableWorkflow();
+        var node = System.Text.Json.Nodes.JsonNode
+            .Parse(_storage.SerializeWorkflow(workflow))!
+            .AsObject();
+        node["TriggerProfiles"] = null;
+
+        Assert.Throws<System.Text.Json.JsonException>(
+            () => _storage.DeserializeWorkflow(node.ToJsonString()));
+    }
+
+    [Fact]
+    public void DeserializeWorkflow_WhenOptionalCollectionsAreMissing_UsesEmptyDefaults()
+    {
+        const string json = """
+            {
+              "SchemaVersion": 1,
+              "Name": "Minimal workflow"
+            }
+            """;
+
+        var workflow = _storage.DeserializeWorkflow(json);
+
+        Assert.Empty(workflow.TriggerProfiles);
+        Assert.Empty(workflow.ActionProfiles);
+        Assert.NotNull(workflow.RulesetProfile);
+        Assert.Empty(workflow.RulesetProfile.Rules);
+    }
+
+    [Fact]
     public async Task RealFileStorageAndAutomationService_CanBeWiredTogether()
     {
         var services = new ServiceCollection();

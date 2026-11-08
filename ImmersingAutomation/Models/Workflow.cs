@@ -26,7 +26,7 @@ public class Workflow
     /// <summary>
     /// 获取或设置工作流的显示名称。
     /// </summary>
-    public string Name { get; set; }
+    public string Name { get; set; } = string.Empty;
 
     /// <summary>
     /// 获取或设置工作流是否启用。
@@ -47,17 +47,17 @@ public class Workflow
     /// <summary>
     /// 获取或设置启动工作流的触发器配置。
     /// </summary>
-    public List<TriggerProfileBase> TriggerProfiles { get; set; }
+    public List<TriggerProfileBase> TriggerProfiles { get; set; } = [];
     
     /// <summary>
     /// 获取或设置执行动作前必须匹配的规则集。
     /// </summary>
-    public RulesetProfile RulesetProfile { get; set; }
+    public RulesetProfile RulesetProfile { get; set; } = new();
     
     /// <summary>
     /// 获取或设置工作流执行的动作配置。
     /// </summary>
-    public List<ActionProfileBase> ActionProfiles { get; set; }
+    public List<ActionProfileBase> ActionProfiles { get; set; } = [];
     
     /// <summary>
     /// 获取或设置动作执行后是否需要回滚。
