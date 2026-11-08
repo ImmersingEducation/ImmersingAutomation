@@ -480,6 +480,57 @@ public class AutomationServiceTests
     }
 
     [Fact]
+    public async Task TriggerQueryLoop_SlowTriggerDoesNotBlockOtherTriggers()
+    {
+        using var blocker = new ManualResetEventSlim(false);
+        var blockingEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var blockingProfile = new TestTriggerProfile
+        {
+            Validator = () =>
+            {
+                blockingEntered.TrySetResult();
+                blocker.Wait(TimeSpan.FromSeconds(10));
+                return false;
+            }
+        };
+
+        var fastValidated = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fastProfile = new TestTriggerProfile
+        {
+            Validator = () =>
+            {
+                // 等待阻塞触发器开始验证，确保顺序执行的实现无法通过此测试。
+                if (blockingEntered.Task.Wait(TimeSpan.FromSeconds(5)))
+                {
+                    fastValidated.TrySetResult();
+                }
+
+                return false;
+            }
+        };
+
+        var storage = new FakeAutomationStorageService();
+        storage.Workflows.Add(TestWorkflows.Create(blockingProfile, isEnabled: true));
+        storage.Workflows.Add(TestWorkflows.Create(fastProfile, isEnabled: true));
+
+        await using var service = new AutomationService(storage)
+        {
+            TriggerPollInterval = TimeSpan.FromMilliseconds(5),
+            TriggerCheckConcurrency = 2
+        };
+
+        try
+        {
+            await service.InitializeAsync();
+            await fastValidated.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            blocker.Set();
+        }
+    }
+
+    [Fact]
     public async Task StopTriggerQueryLoopAsync_ThenStartingAgain_PollsTriggers()
     {
         var profile = new TestTriggerProfile();
@@ -559,6 +610,12 @@ public class AutomationServiceTests
             () => new AutomationService(new FakeAutomationStorageService())
             {
                 ReversionCheckConcurrency = 0
+            });
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => new AutomationService(new FakeAutomationStorageService())
+            {
+                TriggerCheckConcurrency = 0
             });
     }
 }

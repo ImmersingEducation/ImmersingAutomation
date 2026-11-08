@@ -45,6 +45,8 @@ public class AutomationService : IAsyncDisposable
     private TimeSpan _reversionPollInterval = TimeSpan.FromMilliseconds(200);
     private int _reversionCheckConcurrency = 4;
 
+    private int _triggerCheckConcurrency = 4;
+
     /// <summary>
     /// 初始化 <see cref="AutomationService"/> 类的新实例。
     /// </summary>
@@ -108,6 +110,22 @@ public class AutomationService : IAsyncDisposable
     {
         get => _reversionPollInterval;
         init => _reversionPollInterval = ValidateInterval(value, nameof(ReversionPollInterval));
+    }
+
+    /// <summary>
+    /// 获取或设置单次触发器轮询中并发验证的触发器最大数量。
+    /// </summary>
+    /// <remarks>
+    /// 并发轮询可以避免单个缓慢的 <see cref="TriggerBase.Validate"/> 阻塞其他触发器。
+    /// </remarks>
+    public int TriggerCheckConcurrency
+    {
+        get => _triggerCheckConcurrency;
+        init
+        {
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(value);
+            _triggerCheckConcurrency = value;
+        }
     }
 
     /// <summary>
@@ -315,34 +333,26 @@ public class AutomationService : IAsyncDisposable
             while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
             {
                 // Keys 返回快照，因此在循环期间注册/注销是安全的。
-                foreach (var trigger in _activeTriggers.Keys)
+                var triggers = _activeTriggers.Keys.ToArray();
+                if (triggers.Length == 0)
                 {
-                    if (cancellationToken.IsCancellationRequested)
-                    {
-                        break;
-                    }
-
-                    if (trigger.Status is not TriggerStatus.Ready)
-                    {
-                        continue;
-                    }
-
-                    try
-                    {
-                        // Trigger() 内部会进行验证；先调用 Validate() 会重复评估条件，
-                        // 这对消费型触发器来说是错误的。
-                        trigger.Trigger();
-                    }
-                    catch (Exception exception)
-                    {
-                        // 单个触发器出错不应停止整个轮询循环。
-                        RaiseError(
-                            AutomationErrorSource.Trigger,
-                            $"Poll trigger '{trigger.GetType().FullName}'",
-                            exception,
-                            trigger: trigger);
-                    }
+                    continue;
                 }
+
+                // 并发轮询触发器，避免某个缓慢的 Validate 阻塞其他触发器。
+                using var throttle = new SemaphoreSlim(TriggerCheckConcurrency);
+                var pollTasks = new Task[triggers.Length];
+
+                for (var i = 0; i < triggers.Length; i++)
+                {
+                    var trigger = triggers[i];
+                    pollTasks[i] = Task.Run(
+                        async () => await PollTriggerAsync(trigger, throttle, cancellationToken)
+                            .ConfigureAwait(false),
+                        cancellationToken);
+                }
+
+                await Task.WhenAll(pollTasks).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -352,6 +362,47 @@ public class AutomationService : IAsyncDisposable
         catch (Exception exception)
         {
             RaiseError(AutomationErrorSource.Trigger, "Run trigger query loop", exception);
+        }
+    }
+
+    private async Task PollTriggerAsync(
+        TriggerBase trigger,
+        SemaphoreSlim throttle,
+        CancellationToken cancellationToken)
+    {
+        await throttle.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            if (trigger.Status is not TriggerStatus.Ready)
+            {
+                return;
+            }
+
+            try
+            {
+                // Trigger() 内部会进行验证；先调用 Validate() 会重复评估条件，
+                // 这对消费型触发器来说是错误的。
+                trigger.Trigger();
+            }
+            catch (Exception exception)
+            {
+                // 单个触发器出错不应停止整个轮询循环。
+                RaiseError(
+                    AutomationErrorSource.Trigger,
+                    $"Poll trigger '{trigger.GetType().FullName}'",
+                    exception,
+                    trigger: trigger);
+            }
+        }
+        finally
+        {
+            throttle.Release();
         }
     }
 

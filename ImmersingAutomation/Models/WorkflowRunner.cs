@@ -104,6 +104,8 @@ public class WorkflowRunner : IAsyncDisposable
 
     private bool _disposed;
 
+    private int _triggerProcessing;
+
     /// <summary>
     /// 初始化 <see cref="WorkflowRunner"/> 类的新实例。
     /// </summary>
@@ -261,10 +263,29 @@ public class WorkflowRunner : IAsyncDisposable
     /// </summary>
     private void OnTriggered(object? sender, EventArgs eventArgs)
     {
+        // 触发处理是串行化的，因此已有处理器在执行时无需再排队。
+        // 这可以避免电平型触发器在长时间运行的动作期间不断堆积处理任务。
+        if (Interlocked.CompareExchange(ref _triggerProcessing, 1, 0) != 0)
+        {
+            return;
+        }
+
         _ = HandleTriggeredAsync();
     }
 
     private async Task HandleTriggeredAsync()
+    {
+        try
+        {
+            await HandleTriggeredCoreAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            Volatile.Write(ref _triggerProcessing, 0);
+        }
+    }
+
+    private async Task HandleTriggeredCoreAsync()
     {
         if (_disposed || Status is not WorkflowRunnerStatus.WaitingForTriggering) return;
 
