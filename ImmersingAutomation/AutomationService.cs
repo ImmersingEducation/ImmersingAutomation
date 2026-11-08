@@ -5,6 +5,7 @@ using ImmersingAutomation.Enums;
 using ImmersingAutomation.Events;
 using ImmersingAutomation.Models;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace ImmersingAutomation;
 
@@ -26,6 +27,8 @@ public class AutomationService : IAsyncDisposable
     private readonly SemaphoreSlim _workflowChangeLock = new(1, 1);
     private readonly QueryLoopController _triggerLoop;
     private readonly QueryLoopController _reversionLoop;
+    private readonly ILoggerFactory? _loggerFactory;
+    private readonly ILogger<AutomationService>? _logger;
     private readonly object _initializeLock = new();
     private readonly object _providerLock = new();
 
@@ -46,8 +49,11 @@ public class AutomationService : IAsyncDisposable
     /// 初始化 <see cref="AutomationService"/> 类的新实例。
     /// </summary>
     /// <param name="storageService">用于加载和持久化工作流的存储服务。</param>
-    public AutomationService(IAutomationStorageService storageService)
-        : this(storageService, new ServiceCollection())
+    /// <param name="loggerFactory">可选的日志工厂；为 <see langword="null"/> 时不记录日志。</param>
+    public AutomationService(
+        IAutomationStorageService storageService,
+        ILoggerFactory? loggerFactory = null)
+        : this(storageService, new ServiceCollection(), loggerFactory)
     {
     }
 
@@ -56,15 +62,19 @@ public class AutomationService : IAsyncDisposable
     /// </summary>
     /// <param name="storageService">用于加载和持久化工作流的存储服务。</param>
     /// <param name="serviceCollection">用于解析触发器和动作依赖的服务集合。</param>
+    /// <param name="loggerFactory">可选的日志工厂；为 <see langword="null"/> 时不记录日志。</param>
     public AutomationService(
         IAutomationStorageService storageService,
-        IServiceCollection serviceCollection)
+        IServiceCollection serviceCollection,
+        ILoggerFactory? loggerFactory = null)
     {
         ArgumentNullException.ThrowIfNull(storageService);
         ArgumentNullException.ThrowIfNull(serviceCollection);
 
         _storageService = storageService;
         _serviceCollection = serviceCollection;
+        _loggerFactory = loggerFactory;
+        _logger = loggerFactory?.CreateLogger<AutomationService>();
         _triggerLoop = new QueryLoopController(RunTriggerQueryLoopAsync);
         _reversionLoop = new QueryLoopController(RunReversionQueryLoopAsync);
     }
@@ -201,6 +211,10 @@ public class AutomationService : IAsyncDisposable
         // 先构建提供程序，避免初始化过程中向服务集合继续添加注册项。
         GetOrBuildServiceProvider();
 
+        _logger?.LogInformation(
+            "Initializing automation service from '{StoragePath}'.",
+            _storageService.StoragePath);
+
         _workflows = (await _storageService.LoadWorkflowsAsync().ConfigureAwait(false)).ToList();
 
         foreach (var workflow in _workflows)
@@ -238,6 +252,10 @@ public class AutomationService : IAsyncDisposable
             StartTriggerQueryLoop();
             StartReversionQueryLoop();
             IsInitialized = true;
+
+            _logger?.LogInformation(
+                "Automation service initialized with {WorkflowCount} workflow(s).",
+                _workflows.Count);
         }
         catch (Exception exception)
         {
@@ -270,6 +288,9 @@ public class AutomationService : IAsyncDisposable
 
     private void StartTriggerQueryLoop()
     {
+        _logger?.LogDebug(
+            "Starting trigger query loop with interval '{Interval}'.",
+            TriggerPollInterval);
         _triggerLoop.Start();
     }
 
@@ -340,6 +361,8 @@ public class AutomationService : IAsyncDisposable
     /// </summary>
     public async Task StopTriggerQueryLoopAsync()
     {
+        _logger?.LogDebug("Stopping trigger query loop.");
+
         try
         {
             await _triggerLoop.StopAsync().ConfigureAwait(false);
@@ -352,6 +375,9 @@ public class AutomationService : IAsyncDisposable
 
     private void StartReversionQueryLoop()
     {
+        _logger?.LogDebug(
+            "Starting reversion query loop with interval '{Interval}'.",
+            ReversionPollInterval);
         _reversionLoop.Start();
     }
 
@@ -455,6 +481,8 @@ public class AutomationService : IAsyncDisposable
     {
         // 此处不要等待：回滚可能耗时较长，不能阻塞其他运行器的轮询循环。
         // OnReversionTriggered 会自行再次检查运行器状态。
+        _logger?.LogDebug("Triggering reversion for runner '{RunnerGuid}'.", runner.Guid);
+
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         _reversionTasks.TryAdd(completion.Task, 0);
 
@@ -486,6 +514,8 @@ public class AutomationService : IAsyncDisposable
     /// </summary>
     public async Task StopReversionQueryLoopAsync()
     {
+        _logger?.LogDebug("Stopping reversion query loop.");
+
         try
         {
             await _reversionLoop.StopAsync().ConfigureAwait(false);
@@ -573,7 +603,15 @@ public class AutomationService : IAsyncDisposable
                 return;
             }
 
-            runner = new WorkflowRunner(workflow, GetOrBuildServiceProvider());
+            _logger?.LogInformation(
+                "Adding workflow runner for '{WorkflowName}' ({WorkflowGuid}).",
+                workflow.Name,
+                workflow.Guid);
+
+            runner = new WorkflowRunner(
+                workflow,
+                GetOrBuildServiceProvider(),
+                _loggerFactory?.CreateLogger<WorkflowRunner>());
             initializationCompletion = new TaskCompletionSource(
                 TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -688,6 +726,11 @@ public class AutomationService : IAsyncDisposable
             {
                 return;
             }
+
+            _logger?.LogInformation(
+                "Removing workflow runner for '{WorkflowName}' ({WorkflowGuid}).",
+                workflow.Name,
+                workflow.Guid);
 
             _runners.Remove(runner);
             _runnerInitializations.TryGetValue(runner, out initializationTask);
@@ -946,6 +989,8 @@ public class AutomationService : IAsyncDisposable
         _runnerLock.Dispose();
         _workflowChangeLock.Dispose();
         IsInitialized = false;
+
+        _logger?.LogInformation("Automation service disposed.");
     }
 
     private IServiceProvider GetOrBuildServiceProvider()
@@ -1189,6 +1234,11 @@ public class AutomationService : IAsyncDisposable
         TriggerBase? trigger = null)
     {
         Debug.WriteLine($"[AutomationService] {operation} failed: {exception}");
+        _logger?.LogError(
+            exception,
+            "Automation operation '{Operation}' failed (source: {ErrorSource}).",
+            operation,
+            source);
 
         var handlers = ErrorOccurred;
         if (handlers is null)

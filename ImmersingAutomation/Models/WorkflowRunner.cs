@@ -5,6 +5,7 @@ using ImmersingAutomation.Attributes;
 using ImmersingAutomation.Enums;
 using ImmersingAutomation.Events;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace ImmersingAutomation.Models;
 
@@ -83,6 +84,8 @@ public class WorkflowRunner : IAsyncDisposable
 
     private readonly IServiceProvider? _serviceProvider;
 
+    private readonly ILogger<WorkflowRunner>? _logger;
+
     private CancellationTokenSource _verificationSource = new();
 
     private readonly HashSet<ActionBase> _skippedActions = [];
@@ -108,10 +111,15 @@ public class WorkflowRunner : IAsyncDisposable
     /// <param name="serviceProvider">
     /// 用于创建触发器和动作的服务提供程序；为 <see langword="null"/> 时使用无参构造函数。
     /// </param>
-    public WorkflowRunner(Workflow workflow, IServiceProvider? serviceProvider = null)
+    /// <param name="logger">可选的日志记录器；为 <see langword="null"/> 时不记录日志。</param>
+    public WorkflowRunner(
+        Workflow workflow,
+        IServiceProvider? serviceProvider = null,
+        ILogger<WorkflowRunner>? logger = null)
     {
         Workflow = workflow ?? throw new ArgumentNullException(nameof(workflow));
         _serviceProvider = serviceProvider;
+        _logger = logger;
         Triggers = _triggers.AsReadOnly();
         Actions = _actions.AsReadOnly();
     }
@@ -355,6 +363,11 @@ public class WorkflowRunner : IAsyncDisposable
             }
 
             RaiseStatusChanged(WorkflowRunnerStatus.Running);
+
+            _logger?.LogInformation(
+                "Running workflow '{WorkflowName}' ({WorkflowGuid}).",
+                Workflow.Name,
+                Workflow.Guid);
 
             for (var i = 0; i < _actions.Count; i++)
             {
@@ -637,6 +650,12 @@ public class WorkflowRunner : IAsyncDisposable
             _status = WorkflowRunnerStatus.Reverting;
         }
 
+        _logger?.LogInformation(
+            "Reverting workflow '{WorkflowName}' ({WorkflowGuid}) from action index {StartIndex}.",
+            Workflow.Name,
+            Workflow.Guid,
+            startIndex);
+
         RaiseStatusChanged(WorkflowRunnerStatus.Reverting);
         await RevertActionsAsync(startIndex).ConfigureAwait(false);
     }
@@ -801,6 +820,11 @@ public class WorkflowRunner : IAsyncDisposable
         ActionBase? action = null)
     {
         Debug.WriteLine($"[WorkflowRunner] {operation} failed: {exception}");
+        _logger?.LogError(
+            exception,
+            "Workflow runner operation '{Operation}' failed (source: {ErrorSource}).",
+            operation,
+            source);
 
         var handlers = ErrorOccurred;
         if (handlers is null)
@@ -858,6 +882,11 @@ public class WorkflowRunner : IAsyncDisposable
 
     private void RaiseStatusChanged(WorkflowRunnerStatus status)
     {
+        _logger?.LogDebug(
+            "Workflow runner '{RunnerGuid}' changed status to '{Status}'.",
+            Guid,
+            status);
+
         var handlers = StatusChanged;
         if (handlers is null) return;
 

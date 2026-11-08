@@ -1,6 +1,7 @@
 using System.Text.Json.Serialization;
 using ImmersingAutomation.Abstractions;
 using ImmersingAutomation.Attributes;
+using Microsoft.Extensions.Logging;
 
 namespace ImmersingAutomation.Tests;
 
@@ -304,5 +305,55 @@ public sealed class DisposableSingleton : IDisposable
     public void Dispose()
     {
         IsDisposed = true;
+    }
+}
+
+internal sealed record LogEntry(LogLevel Level, string Category, string Message, Exception? Exception);
+
+internal sealed class RecordingLoggerFactory : ILoggerFactory
+{
+    public List<LogEntry> Entries { get; } = [];
+
+    public ILogger CreateLogger(string categoryName)
+    {
+        return new RecordingLogger(this, categoryName);
+    }
+
+    public void AddProvider(ILoggerProvider provider)
+    {
+    }
+
+    public void Dispose()
+    {
+    }
+
+    internal void Add(LogLevel level, string category, string message, Exception? exception)
+    {
+        Entries.Add(new LogEntry(level, category, message, exception));
+    }
+}
+
+internal sealed class RecordingLogger(
+    RecordingLoggerFactory factory,
+    string category) : ILogger
+{
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull
+    {
+        return null;
+    }
+
+    public bool IsEnabled(LogLevel logLevel)
+    {
+        return true;
+    }
+
+    public void Log<TState>(
+        LogLevel logLevel,
+        EventId eventId,
+        TState state,
+        Exception? exception,
+        Func<TState, Exception?, string> formatter)
+    {
+        factory.Add(logLevel, category, formatter(state, exception), exception);
     }
 }

@@ -7,6 +7,7 @@ using ImmersingAutomation.Enums;
 using ImmersingAutomation.Events;
 using ImmersingAutomation.Models;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace ImmersingAutomation;
 
@@ -20,18 +21,24 @@ public sealed class AutomationStorageService : IAutomationStorageService
     private const string TypePropertyName = "$type";
 
     private readonly JsonSerializerOptions _jsonSerializerOptions;
+    private readonly ILogger<AutomationStorageService>? _logger;
 
     /// <summary>
     /// 初始化 <see cref="AutomationStorageService"/> 类的新实例。
     /// </summary>
     /// <param name="typeRegistry">用于序列化多态配置的类型注册表。</param>
     /// <param name="storagePath">存储工作流的目录。</param>
-    public AutomationStorageService(AutomationTypeRegistry typeRegistry, string storagePath)
+    /// <param name="loggerFactory">可选的日志工厂；为 <see langword="null"/> 时不记录日志。</param>
+    public AutomationStorageService(
+        AutomationTypeRegistry typeRegistry,
+        string storagePath,
+        ILoggerFactory? loggerFactory = null)
     {
         ArgumentNullException.ThrowIfNull(typeRegistry);
         ArgumentException.ThrowIfNullOrWhiteSpace(storagePath);
 
         _jsonSerializerOptions = CreateJsonSerializerOptions(typeRegistry);
+        _logger = loggerFactory?.CreateLogger<AutomationStorageService>();
         StoragePath = Path.GetFullPath(storagePath);
     }
 
@@ -40,11 +47,15 @@ public sealed class AutomationStorageService : IAutomationStorageService
     /// </summary>
     /// <param name="services">包含自动化类型注册项的服务集合。</param>
     /// <param name="storagePath">存储工作流的目录。</param>
+    /// <param name="loggerFactory">可选的日志工厂；为 <see langword="null"/> 时不记录日志。</param>
     /// <remarks>
     /// 注册表在构造时创建，因此之后向 <paramref name="services"/> 添加的类型不会被此实例识别。
     /// </remarks>
-    public AutomationStorageService(IServiceCollection services, string storagePath)
-        : this(AutomationTypeRegistry.Create(services), storagePath)
+    public AutomationStorageService(
+        IServiceCollection services,
+        string storagePath,
+        ILoggerFactory? loggerFactory = null)
+        : this(AutomationTypeRegistry.Create(services), storagePath, loggerFactory)
     {
     }
 
@@ -168,6 +179,8 @@ public sealed class AutomationStorageService : IAutomationStorageService
             await File.WriteAllTextAsync(temporaryFilePath, json, Encoding.UTF8, cancellationToken)
                 .ConfigureAwait(false);
             File.Move(temporaryFilePath, filePath, overwrite: true);
+
+            _logger?.LogDebug("Saved workflow '{WorkflowGuid}' to '{FilePath}'.", workflow.Guid, filePath);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -309,6 +322,10 @@ public sealed class AutomationStorageService : IAutomationStorageService
     private void RaiseError(string operation, Exception exception)
     {
         Debug.WriteLine($"[AutomationStorageService] {operation} failed: {exception}");
+        _logger?.LogError(
+            exception,
+            "Automation storage operation '{Operation}' failed.",
+            operation);
 
         var handlers = ErrorOccurred;
         if (handlers is null)

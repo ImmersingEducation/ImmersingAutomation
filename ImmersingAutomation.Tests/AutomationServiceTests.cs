@@ -3,6 +3,7 @@ using ImmersingAutomation.Enums;
 using ImmersingAutomation.Events;
 using ImmersingAutomation.Models;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace ImmersingAutomation.Tests;
 
@@ -428,6 +429,23 @@ public class AutomationServiceTests
         Assert.Equal(1, validProfile.InitializeCount);
         Assert.NotNull(error);
         Assert.Equal(AutomationErrorSource.Workflow, error.Source);
+    }
+
+    [Fact]
+    public async Task InitializeAsync_WhenWorkflowFails_LogsError()
+    {
+        var loggerFactory = new RecordingLoggerFactory();
+        var storage = new FakeAutomationStorageService();
+        storage.Workflows.Add(TestWorkflows.Create(new UnattributedTriggerProfile(), isEnabled: true));
+
+        await using var service = new AutomationService(storage, loggerFactory);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => service.InitializeAsync());
+
+        Assert.Contains(
+            loggerFactory.Entries,
+            entry => entry.Level == LogLevel.Error
+                     && entry.Exception is InvalidOperationException);
     }
 
     [Fact]
