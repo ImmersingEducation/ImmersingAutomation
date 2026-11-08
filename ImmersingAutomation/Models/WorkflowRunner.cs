@@ -402,7 +402,9 @@ public class WorkflowRunner : IAsyncDisposable
 
         if (resetImmediately)
         {
-            // No reversion loop is running, so cancel the pending reversion right here.
+            // No reversion loop is running, so cancel the pending reversion right here and
+            // return every action to the idle state without invoking their reversion.
+            ResetAllActions();
             CompleteInterruption();
             return true;
         }
