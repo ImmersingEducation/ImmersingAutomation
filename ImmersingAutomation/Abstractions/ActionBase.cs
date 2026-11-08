@@ -70,7 +70,12 @@ public abstract class ActionBase
         InterruptionToken.ThrowIfCancellationRequested();
     }
 
-    public async Task RunAsync()
+    /// <summary>
+    /// Runs the action.
+    /// When <paramref name="isReversionNeeded"/> is <see langword="true"/>, the action waits for
+    /// <see cref="RevertAsync"/> after running; otherwise it returns directly to the idle state.
+    /// </summary>
+    public async Task RunAsync(bool isReversionNeeded)
     {
         CancellationToken interruptionToken;
 
@@ -96,7 +101,15 @@ public abstract class ActionBase
         {
             lock (_statusLock)
             {
-                _status = ActionStatus.WaitingForReversion;
+                if (isReversionNeeded)
+                {
+                    _status = ActionStatus.WaitingForReversion;
+                }
+                else
+                {
+                    ResetInterruptionSource();
+                    _status = ActionStatus.WaitingForRunning;
+                }
             }
         }
     }
