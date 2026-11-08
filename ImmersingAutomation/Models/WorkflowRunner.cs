@@ -13,6 +13,11 @@ namespace ImmersingAutomation.Models;
 /// 执行单个 <see cref="Workflow"/>：根据工作流配置创建触发器、规则集和动作，
 /// 并驱动它们完成状态转换。
 /// </summary>
+/// <remarks>
+/// 触发器处理是串行化的；一次处理尚未结束时到达的触发事件会被丢弃，而不会排队。
+/// 电平型触发器（条件持续为真）会在下一次轮询时再次触发；边沿型或消费型触发器
+/// 如需保证不丢事件，应在其自身实现中缓冲事件。
+/// </remarks>
 public class WorkflowRunner : IAsyncDisposable
 {
     /// <summary>
@@ -264,7 +269,8 @@ public class WorkflowRunner : IAsyncDisposable
     private void OnTriggered(object? sender, EventArgs eventArgs)
     {
         // 触发处理是串行化的，因此已有处理器在执行时无需再排队。
-        // 这可以避免电平型触发器在长时间运行的动作期间不断堆积处理任务。
+        // 这可以避免电平型触发器在长时间运行的动作期间不断堆积处理任务，
+        // 代价是处理期间到达的触发会被丢弃；边沿型触发器需要自行缓冲事件。
         if (Interlocked.CompareExchange(ref _triggerProcessing, 1, 0) != 0)
         {
             return;
