@@ -164,5 +164,9 @@ public abstract class ActionBase
 
 public abstract class ActionBase<T> : ActionBase where T : ActionProfileBase
 {
-    public T Profile => (_profile as T)!;
+    public T Profile
+    {
+        get => (_profile as T)!;
+        init => _profile = value;
+    }
 }

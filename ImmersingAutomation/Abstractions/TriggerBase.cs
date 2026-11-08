@@ -171,5 +171,9 @@ public abstract class TriggerBase : IAsyncDisposable
 
 public abstract class TriggerBase<T> : TriggerBase where T : TriggerProfileBase
 {
-    public T Profile => (_profile as T)!;
+    public T Profile
+    {
+        get => (_profile as T)!;
+        init => _profile = value;
+    }
 }
