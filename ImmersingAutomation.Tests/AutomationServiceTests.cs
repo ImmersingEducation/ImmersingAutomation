@@ -118,6 +118,42 @@ public class AutomationServiceTests
     }
 
     [Fact]
+    public async Task IsEnabledChanges_WhenRaisedRapidly_ConvergeToLatestState()
+    {
+        var profile = new TestTriggerProfile();
+        var workflow = TestWorkflows.Create(profile, isEnabled: true);
+        var storage = new FakeAutomationStorageService();
+        storage.Workflows.Add(workflow);
+
+        await using var service = new AutomationService(storage)
+        {
+            TriggerPollInterval = TimeSpan.FromMinutes(1)
+        };
+
+        await service.InitializeAsync();
+
+        // 事件处理器会被并发调度，不能假设它们按触发顺序执行。
+        for (var i = 0; i < 25; i++)
+        {
+            workflow.IsEnabled = false;
+            workflow.IsEnabled = true;
+        }
+
+        // 最终状态为禁用：必须存在可以释放的运行器；
+        // 若竞态导致运行器被过早移除，此等待会超时。
+        profile.Released = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        workflow.IsEnabled = false;
+        await profile.Released.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // 再次启用时必须重新创建并初始化运行器。
+        profile.Initialized = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        workflow.IsEnabled = true;
+        await profile.Initialized.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(profile.InitializeCount >= 2);
+    }
+
+    [Fact]
     public async Task AddWorkflowRunner_WhenAlreadyAdded_DoesNotInitializeTwice()
     {
         var profile = new TestTriggerProfile();

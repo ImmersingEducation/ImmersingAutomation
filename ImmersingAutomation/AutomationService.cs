@@ -21,7 +21,9 @@ public class AutomationService : IAsyncDisposable
     private readonly ConcurrentDictionary<WorkflowRunner, byte> _reversionRunners = new();
     private readonly ConcurrentDictionary<Task, byte> _reversionTasks = new();
     private readonly ConcurrentDictionary<WorkflowRunner, Task> _runnerInitializations = new();
+    private readonly ConcurrentDictionary<Task, byte> _workflowChangeTasks = new();
     private readonly SemaphoreSlim _runnerLock = new(1, 1);
+    private readonly SemaphoreSlim _workflowChangeLock = new(1, 1);
     private readonly CancellationTokenSource _triggerLoopSource = new();
     private readonly CancellationTokenSource _reversionLoopSource = new();
     private readonly object _initializeLock = new();
@@ -530,7 +532,14 @@ public class AutomationService : IAsyncDisposable
     /// </summary>
     private void OnWorkflowIsEnabledChanged(object? sender, EventArgs e)
     {
-        _ = HandleWorkflowIsEnabledChangedAsync(sender);
+        var changeTask = HandleWorkflowIsEnabledChangedAsync(sender);
+        _workflowChangeTasks.TryAdd(changeTask, 0);
+        _ = changeTask.ContinueWith(
+            static (task, state) => ((ConcurrentDictionary<Task, byte>)state!).TryRemove(task, out _),
+            _workflowChangeTasks,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     private async Task HandleWorkflowIsEnabledChangedAsync(object? sender)
@@ -545,13 +554,24 @@ public class AutomationService : IAsyncDisposable
                 return;
             }
 
-            if (workflow.IsEnabled)
+            // 串行化所有启停变更，并在锁内读取最新状态。事件处理器的调度顺序
+            // 与事件触发顺序无关，因此不能按“事件内容”直接添加或移除运行器；
+            // 只有在锁内重新读取 IsEnabled，最终才能收敛到最新状态。
+            await _workflowChangeLock.WaitAsync().ConfigureAwait(false);
+            try
             {
-                await AddWorkflowRunner(workflow).ConfigureAwait(false);
+                if (workflow.IsEnabled)
+                {
+                    await AddWorkflowRunner(workflow).ConfigureAwait(false);
+                }
+                else
+                {
+                    await RemoveWorkflowRunner(workflow).ConfigureAwait(false);
+                }
             }
-            else
+            finally
             {
-                await RemoveWorkflowRunner(workflow).ConfigureAwait(false);
+                _workflowChangeLock.Release();
             }
         }
         catch (Exception exception)
@@ -874,6 +894,26 @@ public class AutomationService : IAsyncDisposable
             }
         }
 
+        // 先解除启停订阅，再等待已排队的变更处理完成，避免销毁过程中
+        // 仍有处理器添加或移除运行器。
+        foreach (var workflow in _workflows)
+        {
+            workflow.IsEnabledChanged -= OnWorkflowIsEnabledChanged;
+        }
+
+        var workflowChangeTasks = _workflowChangeTasks.Keys.ToArray();
+        if (workflowChangeTasks.Length > 0)
+        {
+            try
+            {
+                await Task.WhenAll(workflowChangeTasks).ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                RaiseError(AutomationErrorSource.Disposal, "Wait for workflow changes", exception);
+            }
+        }
+
         await _runnerLock.WaitAsync().ConfigureAwait(false);
         try
         {
@@ -928,12 +968,14 @@ public class AutomationService : IAsyncDisposable
         _reversionRunners.Clear();
         _reversionTasks.Clear();
         _runnerInitializations.Clear();
+        _workflowChangeTasks.Clear();
 
         await DisposeOwnedServiceProviderAsync().ConfigureAwait(false);
 
         _triggerLoopSource.Dispose();
         _reversionLoopSource.Dispose();
         _runnerLock.Dispose();
+        _workflowChangeLock.Dispose();
         IsInitialized = false;
     }
 
