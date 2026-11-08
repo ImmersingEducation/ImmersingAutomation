@@ -117,14 +117,6 @@ public class WorkflowRunner : IAsyncDisposable
     }
 
     /// <summary>
-    /// 同步初始化运行器。在异步路径中优先使用 <see cref="InitializeAsync"/>。
-    /// </summary>
-    public void Initialize()
-    {
-        Task.Run(InitializeAsync).GetAwaiter().GetResult();
-    }
-
-    /// <summary>
     /// 根据工作流配置创建触发器、规则集和动作，并初始化触发器。
     /// 运行器初始化完成后，重复调用将被忽略。
     /// </summary>

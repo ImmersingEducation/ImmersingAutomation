@@ -139,18 +139,39 @@ public class AutomationServiceTests
             workflow.IsEnabled = true;
         }
 
-        // 最终状态为禁用：必须存在可以释放的运行器；
-        // 若竞态导致运行器被过早移除，此等待会超时。
-        profile.Released = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        // 最终状态为启用：所有排队的变更处理完成后，应恰好存在一个运行器。
+        await WaitUntilAsync(
+            () => profile.InitializeCount - profile.ReleaseCount == 1,
+            "A runner should exist after the workflow is enabled.");
+
+        // 最终状态为禁用：运行器必须被释放。
         workflow.IsEnabled = false;
-        await profile.Released.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(
+            () => profile.ReleaseCount == profile.InitializeCount,
+            "The runner should be released after the workflow is disabled.");
 
         // 再次启用时必须重新创建并初始化运行器。
-        profile.Initialized = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         workflow.IsEnabled = true;
-        await profile.Initialized.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(
+            () => profile.InitializeCount - profile.ReleaseCount == 1,
+            "A runner should be created after the workflow is re-enabled.");
 
         Assert.True(profile.InitializeCount >= 2);
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition, string message)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+
+        while (!condition())
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                throw new TimeoutException(message);
+            }
+
+            await Task.Delay(10);
+        }
     }
 
     [Fact]
@@ -438,6 +459,67 @@ public class AutomationServiceTests
             () => service.AddWorkflowRunner(TestWorkflows.Create()));
         await Assert.ThrowsAsync<ObjectDisposedException>(
             () => service.RemoveWorkflowRunner(TestWorkflows.Create()));
+    }
+
+    [Fact]
+    public async Task StopTriggerQueryLoopAsync_ThenStartingAgain_PollsTriggers()
+    {
+        var profile = new TestTriggerProfile();
+        var workflow = TestWorkflows.Create(profile, isEnabled: true);
+        var storage = new FakeAutomationStorageService();
+        storage.Workflows.Add(workflow);
+
+        await using var service = new AutomationService(storage)
+        {
+            TriggerPollInterval = TimeSpan.FromMilliseconds(5)
+        };
+
+        await service.InitializeAsync();
+        await service.StopTriggerQueryLoopAsync();
+
+        var validated = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        profile.Validator = () =>
+        {
+            validated.TrySetResult();
+            return false;
+        };
+
+        using var cancellationSource = new CancellationTokenSource();
+        var loop = service.TriggerQueryLoop(cancellationSource.Token);
+
+        await validated.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await cancellationSource.CancelAsync();
+        await loop.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task ServiceCollection_WhenServiceIsInitialized_Throws()
+    {
+        var service = new AutomationService(new FakeAutomationStorageService());
+        await service.InitializeAsync();
+
+        Assert.Throws<InvalidOperationException>(
+            () => service.ServiceCollection = new ServiceCollection());
+
+        await service.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task ServiceProvider_WhenSet_DoesNotMarkServiceAsInitialized()
+    {
+        var service = new AutomationService(new FakeAutomationStorageService());
+        using var provider = new ServiceCollection().BuildServiceProvider();
+
+        service.ServiceProvider = provider;
+
+        Assert.False(service.IsInitialized);
+
+        await service.InitializeAsync();
+
+        Assert.True(service.IsInitialized);
+
+        await service.DisposeAsync();
     }
 
     [Fact]

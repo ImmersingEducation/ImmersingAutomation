@@ -24,22 +24,18 @@ public class AutomationService : IAsyncDisposable
     private readonly ConcurrentDictionary<Task, byte> _workflowChangeTasks = new();
     private readonly SemaphoreSlim _runnerLock = new(1, 1);
     private readonly SemaphoreSlim _workflowChangeLock = new(1, 1);
-    private readonly CancellationTokenSource _triggerLoopSource = new();
-    private readonly CancellationTokenSource _reversionLoopSource = new();
+    private readonly QueryLoopController _triggerLoop;
+    private readonly QueryLoopController _reversionLoop;
     private readonly object _initializeLock = new();
     private readonly object _providerLock = new();
 
     private IServiceCollection _serviceCollection;
     private IServiceProvider? _serviceProvider;
     private bool _ownsServiceProvider;
-    private IAutomationStorageService _storageService;
+    private readonly IAutomationStorageService _storageService;
     private List<Workflow> _workflows = [];
     private List<WorkflowRunner> _runners = [];
-    private Task? _triggerLoopTask;
-    private Task? _reversionLoopTask;
     private Task? _initializeTask;
-    private int _triggerLoopRunning;
-    private int _reversionLoopRunning;
     private int _disposed;
 
     private TimeSpan _triggerPollInterval = TimeSpan.FromMilliseconds(100);
@@ -69,6 +65,8 @@ public class AutomationService : IAsyncDisposable
 
         _storageService = storageService;
         _serviceCollection = serviceCollection;
+        _triggerLoop = new QueryLoopController(RunTriggerQueryLoopAsync);
+        _reversionLoop = new QueryLoopController(RunReversionQueryLoopAsync);
     }
 
     /// <summary>
@@ -127,15 +125,26 @@ public class AutomationService : IAsyncDisposable
     /// <summary>
     /// 获取或设置用于构建服务提供程序的服务集合；服务初始化后为 <see langword="null"/>。
     /// </summary>
+    /// <exception cref="InvalidOperationException">服务已初始化。</exception>
     public IServiceCollection? ServiceCollection
     {
         get => !IsInitialized ? _serviceCollection : null;
-        set => _serviceCollection = value ?? new ServiceCollection();
+        set
+        {
+            if (IsInitialized)
+            {
+                throw new InvalidOperationException(
+                    "The service collection cannot be changed after the service is initialized.");
+            }
+
+            _serviceCollection = value ?? new ServiceCollection();
+        }
     }
 
     /// <summary>
     /// 获取或设置用于解析自动化类型的服务提供程序；服务未初始化时为 <see langword="null"/>。
-    /// 设置提供程序也会将服务标记为已初始化，但不会加载工作流或启动查询循环。
+    /// 设置提供程序不会加载工作流或启动查询循环，也不代表服务已初始化；
+    /// 仍需调用 <see cref="InitializeAsync"/>。
     /// </summary>
     public IServiceProvider? ServiceProvider
     {
@@ -152,8 +161,6 @@ public class AutomationService : IAsyncDisposable
                 _serviceProvider = value;
                 _ownsServiceProvider = false;
             }
-
-            IsInitialized = true;
         }
     }
 
@@ -263,33 +270,19 @@ public class AutomationService : IAsyncDisposable
 
     private void StartTriggerQueryLoop()
     {
-        if (Interlocked.CompareExchange(ref _triggerLoopRunning, 1, 0) != 0)
-        {
-            return;
-        }
-
-        _triggerLoopTask = Task.Run(() => RunTriggerQueryLoopAsync(_triggerLoopSource.Token));
+        _triggerLoop.Start();
     }
 
     /// <summary>
     /// 轮询已注册的触发器，直到 <paramref name="cancellationToken"/> 被取消。
-    /// 同一时间只能运行一个循环。
+    /// 同一时间只能运行一个循环；循环结束后可以再次启动。
     /// </summary>
     public async Task TriggerQueryLoop(CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
 
-        if (Interlocked.CompareExchange(ref _triggerLoopRunning, 1, 0) != 0)
-        {
-            throw new InvalidOperationException("The trigger query loop is already running.");
-        }
-
         // 服务生命周期也会停止由外部调用方启动的循环。
-        using var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(
-            cancellationToken,
-            _triggerLoopSource.Token);
-
-        await RunTriggerQueryLoopAsync(linkedSource.Token).ConfigureAwait(false);
+        await _triggerLoop.RunAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private async Task RunTriggerQueryLoopAsync(CancellationToken cancellationToken)
@@ -339,69 +332,38 @@ public class AutomationService : IAsyncDisposable
         {
             RaiseError(AutomationErrorSource.Trigger, "Run trigger query loop", exception);
         }
-        finally
-        {
-            Volatile.Write(ref _triggerLoopRunning, 0);
-        }
     }
 
     /// <summary>
     /// 停止由 <see cref="InitializeAsync"/> 启动的触发器查询循环，并等待其结束。
+    /// 之后可以再次启动循环。
     /// </summary>
     public async Task StopTriggerQueryLoopAsync()
     {
-        await _triggerLoopSource.CancelAsync().ConfigureAwait(false);
-
-        var task = _triggerLoopTask;
-        if (task is null)
-        {
-            return;
-        }
-
         try
         {
-            await task.ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            // 服务关闭时属于预期情况。
+            await _triggerLoop.StopAsync().ConfigureAwait(false);
         }
         catch (Exception exception)
         {
             RaiseError(AutomationErrorSource.Trigger, "Stop trigger query loop", exception);
         }
-
-        _triggerLoopTask = null;
     }
 
     private void StartReversionQueryLoop()
     {
-        if (Interlocked.CompareExchange(ref _reversionLoopRunning, 1, 0) != 0)
-        {
-            return;
-        }
-
-        _reversionLoopTask = Task.Run(() => RunReversionQueryLoopAsync(_reversionLoopSource.Token));
+        _reversionLoop.Start();
     }
 
     /// <summary>
     /// 轮询等待回滚的运行器的规则集，并在规则集不再匹配时立即开始回滚。
-    /// 同一时间只能运行一个循环。
+    /// 同一时间只能运行一个循环；循环结束后可以再次启动。
     /// </summary>
     public async Task ReversionQueryLoop(CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
 
-        if (Interlocked.CompareExchange(ref _reversionLoopRunning, 1, 0) != 0)
-        {
-            throw new InvalidOperationException("The reversion query loop is already running.");
-        }
-
-        using var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(
-            cancellationToken,
-            _reversionLoopSource.Token);
-
-        await RunReversionQueryLoopAsync(linkedSource.Token).ConfigureAwait(false);
+        await _reversionLoop.RunAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private async Task RunReversionQueryLoopAsync(CancellationToken cancellationToken)
@@ -437,10 +399,6 @@ public class AutomationService : IAsyncDisposable
         catch (Exception exception)
         {
             RaiseError(AutomationErrorSource.Ruleset, "Run reversion query loop", exception);
-        }
-        finally
-        {
-            Volatile.Write(ref _reversionLoopRunning, 0);
         }
     }
 
@@ -524,31 +482,18 @@ public class AutomationService : IAsyncDisposable
 
     /// <summary>
     /// 停止由 <see cref="InitializeAsync"/> 启动的回滚查询循环，并等待其结束。
+    /// 之后可以再次启动循环。
     /// </summary>
     public async Task StopReversionQueryLoopAsync()
     {
-        await _reversionLoopSource.CancelAsync().ConfigureAwait(false);
-
-        var task = _reversionLoopTask;
-        if (task is null)
-        {
-            return;
-        }
-
         try
         {
-            await task.ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            // 服务关闭时属于预期情况。
+            await _reversionLoop.StopAsync().ConfigureAwait(false);
         }
         catch (Exception exception)
         {
             RaiseError(AutomationErrorSource.Ruleset, "Stop reversion query loop", exception);
         }
-
-        _reversionLoopTask = null;
     }
 
     /// <summary>
@@ -996,8 +941,8 @@ public class AutomationService : IAsyncDisposable
 
         await DisposeOwnedServiceProviderAsync().ConfigureAwait(false);
 
-        _triggerLoopSource.Dispose();
-        _reversionLoopSource.Dispose();
+        await _triggerLoop.DisposeAsync().ConfigureAwait(false);
+        await _reversionLoop.DisposeAsync().ConfigureAwait(false);
         _runnerLock.Dispose();
         _workflowChangeLock.Dispose();
         IsInitialized = false;
@@ -1048,6 +993,190 @@ public class AutomationService : IAsyncDisposable
         catch (Exception exception)
         {
             RaiseError(AutomationErrorSource.Disposal, "Dispose service provider", exception);
+        }
+    }
+
+    /// <summary>
+    /// 管理查询循环的启动、停止与重启。
+    /// 每次运行使用独立的取消源，因此循环停止后可以再次启动；
+    /// 生命周期取消源只在服务销毁时取消。
+    /// </summary>
+    private sealed class QueryLoopController : IAsyncDisposable
+    {
+        private readonly object _gate = new();
+        private readonly Func<CancellationToken, Task> _runAsync;
+        private readonly CancellationTokenSource _lifetimeSource = new();
+        private CancellationTokenSource? _runSource;
+        private Task? _task;
+        private bool _disposed;
+
+        public QueryLoopController(Func<CancellationToken, Task> runAsync)
+        {
+            _runAsync = runAsync;
+        }
+
+        /// <summary>
+        /// 在后台启动循环；已在运行时返回现有任务。
+        /// </summary>
+        public Task Start()
+        {
+            lock (_gate)
+            {
+                ThrowIfDisposed();
+
+                if (_task is { IsCompleted: false })
+                {
+                    return _task;
+                }
+
+                ClearCompletedRunLocked();
+
+                var runSource = new CancellationTokenSource();
+                _runSource = runSource;
+                _task = Task.Run(() => RunCoreAsync(runSource, CancellationToken.None));
+                return _task;
+            }
+        }
+
+        /// <summary>
+        /// 使用调用方的取消标记运行循环；已在运行时抛出异常。
+        /// </summary>
+        public async Task RunAsync(CancellationToken cancellationToken)
+        {
+            Task task;
+
+            lock (_gate)
+            {
+                ThrowIfDisposed();
+
+                if (_task is { IsCompleted: false })
+                {
+                    throw new InvalidOperationException("The query loop is already running.");
+                }
+
+                ClearCompletedRunLocked();
+
+                var runSource = new CancellationTokenSource();
+                _runSource = runSource;
+                task = RunCoreAsync(runSource, cancellationToken);
+                _task = task;
+            }
+
+            await task.ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// 停止当前运行并等待其结束；循环未运行时不执行任何操作。
+        /// </summary>
+        public async Task StopAsync()
+        {
+            Task? task;
+            CancellationTokenSource? runSource;
+
+            lock (_gate)
+            {
+                task = _task;
+                runSource = _runSource;
+            }
+
+            if (runSource is not null)
+            {
+                try
+                {
+                    await runSource.CancelAsync().ConfigureAwait(false);
+                }
+                catch (ObjectDisposedException)
+                {
+                    // 循环已经结束并释放了取消源。
+                }
+            }
+
+            if (task is not null)
+            {
+                try
+                {
+                    await task.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    // 停止循环属于预期情况。
+                }
+            }
+
+            lock (_gate)
+            {
+                if (ReferenceEquals(_task, task))
+                {
+                    _task = null;
+                }
+            }
+        }
+
+        private async Task RunCoreAsync(
+            CancellationTokenSource runSource,
+            CancellationToken externalToken)
+        {
+            using var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(
+                externalToken,
+                runSource.Token,
+                _lifetimeSource.Token);
+
+            try
+            {
+                await _runAsync(linkedSource.Token).ConfigureAwait(false);
+            }
+            finally
+            {
+                lock (_gate)
+                {
+                    if (ReferenceEquals(_runSource, runSource))
+                    {
+                        _runSource = null;
+                    }
+                }
+
+                // 本次运行是取消源的唯一所有者，StopAsync 只负责取消。
+                runSource.Dispose();
+            }
+        }
+
+        private void ClearCompletedRunLocked()
+        {
+            if (_task is { IsCompleted: true })
+            {
+                _task = null;
+                _runSource = null;
+            }
+        }
+
+        private void ThrowIfDisposed()
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            lock (_gate)
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                _disposed = true;
+            }
+
+            try
+            {
+                await _lifetimeSource.CancelAsync().ConfigureAwait(false);
+            }
+            catch (ObjectDisposedException)
+            {
+                // 已经销毁。
+            }
+
+            await StopAsync().ConfigureAwait(false);
+            _lifetimeSource.Dispose();
         }
     }
 
