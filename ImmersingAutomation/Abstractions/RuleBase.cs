@@ -15,7 +15,7 @@ public abstract class RuleBase
     } 
 }
 
-public abstract class RuleBase<T> : RuleBase where T : class
+public abstract class RuleBase<T> : RuleBase where T : RuleProfileBase
 {
     public T Profile => (_profile as T)!;
 }

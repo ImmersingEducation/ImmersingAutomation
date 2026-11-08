@@ -160,6 +160,7 @@ public sealed class AutomationStorageService : IAutomationStorageService
         {
             return typeToConvert == typeof(TriggerProfileBase)
                    || typeToConvert == typeof(ActionProfileBase)
+                   || typeToConvert == typeof(RuleProfileBase)
                    || typeToConvert == typeof(RuleBase);
         }
 
@@ -173,6 +174,11 @@ public sealed class AutomationStorageService : IAutomationStorageService
             if (typeToConvert == typeof(ActionProfileBase))
             {
                 return new AutomationPolymorphicConverter<ActionProfileBase>(_typeRegistry);
+            }
+
+            if (typeToConvert == typeof(RuleProfileBase))
+            {
+                return new AutomationPolymorphicConverter<RuleProfileBase>(_typeRegistry);
             }
 
             if (typeToConvert == typeof(RuleBase))
@@ -243,10 +249,12 @@ public sealed class AutomationStorageService : IAutomationStorageService
 
         private readonly Dictionary<Type, Guid> _triggerProfileTypeIds = new();
         private readonly Dictionary<Type, Guid> _actionProfileTypeIds = new();
+        private readonly Dictionary<Type, Guid> _ruleProfileTypeIds = new();
         private readonly Dictionary<Type, Guid> _ruleTypeIds = new();
 
         private readonly Dictionary<Guid, Type> _triggerProfileTypes = new();
         private readonly Dictionary<Guid, Type> _actionProfileTypes = new();
+        private readonly Dictionary<Guid, Type> _ruleProfileTypes = new();
 
         public static AutomationTypeRegistry Create(IEnumerable<ServiceDescriptor> descriptors)
         {
@@ -302,6 +310,12 @@ public sealed class AutomationStorageService : IAutomationStorageService
             {
                 Add(_ruleTypes, ruleAttribute.Guid, implementationType, "rule");
                 Add(_ruleTypeIds, implementationType, ruleAttribute.Guid, "rule");
+
+                var profileType = GetGenericArgument(implementationType, typeof(RuleBase<>));
+                if (profileType is not null)
+                {
+                    Add(_ruleProfileTypeIds, profileType, ruleAttribute.Guid, "rule profile");
+                }
             }
 
             var actionAttribute = implementationType.GetCustomAttribute<ActionAttribute>(inherit: false);
@@ -346,6 +360,21 @@ public sealed class AutomationStorageService : IAutomationStorageService
 
                     Add(_actionProfileTypeIds, implementationType, actionAttribute.Guid, "action profile");
                     Add(_actionProfileTypes, actionAttribute.Guid, implementationType, "action profile");
+                }
+            }
+
+            if (typeof(RuleProfileBase).IsAssignableFrom(implementationType))
+            {
+                var profileAttribute = implementationType.GetCustomAttribute<RuleProfileAttribute>(inherit: false);
+                if (profileAttribute is not null)
+                {
+                    var ruleAttribute = GetRequiredAttribute<RuleAttribute>(
+                        profileAttribute.RuleType,
+                        "rule",
+                        implementationType);
+
+                    Add(_ruleProfileTypeIds, implementationType, ruleAttribute.Guid, "rule profile");
+                    Add(_ruleProfileTypes, ruleAttribute.Guid, implementationType, "rule profile");
                 }
             }
         }
@@ -421,6 +450,28 @@ public sealed class AutomationStorageService : IAutomationStorageService
                     $"or annotate the profile with a [{nameof(ActionProfileAttribute)}].");
             }
 
+            if (baseType == typeof(RuleProfileBase))
+            {
+                if (_ruleProfileTypeIds.TryGetValue(concreteType, out var ruleTypeId))
+                {
+                    return ruleTypeId;
+                }
+
+                var profileAttribute = concreteType.GetCustomAttribute<RuleProfileAttribute>(inherit: false);
+                if (profileAttribute is not null)
+                {
+                    return GetRequiredAttribute<RuleAttribute>(
+                        profileAttribute.RuleType,
+                        "rule",
+                        concreteType).Guid;
+                }
+
+                throw new InvalidOperationException(
+                    $"Rule profile type '{concreteType.FullName}' is not associated with a registered rule. " +
+                    $"Make sure the corresponding rule implementation is registered and has a [{nameof(RuleAttribute)}], " +
+                    $"or annotate the profile with a [{nameof(RuleProfileAttribute)}].");
+            }
+
             if (baseType == typeof(RuleBase))
             {
                 if (_ruleTypeIds.TryGetValue(concreteType, out var ruleTypeId))
@@ -457,6 +508,13 @@ public sealed class AutomationStorageService : IAutomationStorageService
                 return _actionProfileTypes.TryGetValue(typeId, out var actionProfileType)
                     ? actionProfileType
                     : GetProfileType(_actionTypes, typeId, typeof(ActionBase<>), "action");
+            }
+
+            if (baseType == typeof(RuleProfileBase))
+            {
+                return _ruleProfileTypes.TryGetValue(typeId, out var ruleProfileType)
+                    ? ruleProfileType
+                    : GetProfileType(_ruleTypes, typeId, typeof(RuleBase<>), "rule");
             }
 
             if (baseType == typeof(RuleBase))
